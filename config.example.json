@@ -1,0 +1,165 @@
+{
+  "listen_host": "0.0.0.0",
+  "listen_port": 8790,
+  "data_dir": "./data",
+  "auth_dir": "./auths",
+  "db_path": "",
+  "static_dir": "",
+  "public_base_url": "",
+
+  "upstream": {
+    "timeout_seconds": 120,
+    "header_timeout_seconds": 120,
+    "idle_timeout_seconds": 300,
+    "user_agent": "",
+    "client_version": "",
+    "cli_version": "",
+    "client_name": "",
+    "device_token": "",
+    "device_token_file": "",
+    "passthrough_ip": false
+  },
+
+  "captcha": {
+    "enabled": true,
+    "headless": true,
+    "pool_size": 3,
+    "per_attempt_ms": 15000,
+    "gap_ms": 300,
+    "idle_sleep_ms": 1000,
+    "max_wait_seconds": 20,
+    "fail_backoff_ms": 5000,
+    "fail_backoff_max_ms": 120000,
+    "restart_backoff_ms": 5000,
+    "restart_backoff_max_ms": 300000,
+    "restart_max_consecutive": 20,
+    "chrome_path": "",
+    "scene_id": "",
+    "prefix": "",
+    "region": ""
+  },
+
+  "pool": {
+    "max_in_flight": 3,
+    "max_in_flight_global": 2,
+    "breaker_threshold": 3,
+    "breaker_cooldown_seconds": 1800,
+    "breaker_cooldown_max_seconds": 21600,
+    "degrade_threshold": 5,
+    "degrade_cooldown_seconds": 600,
+    "degrade_cooldown_max_seconds": 7200,
+    "idle_weight_per_hour": 0.5,
+    "idle_weight_max": 5.0,
+    "expiring_soon_seconds": 604800,
+    "cost_explore_interval_seconds": 1800,
+    "soft_rate_seconds": 600,
+    "soft_rate_max_seconds": 7200,
+    "not_found_seconds": 60,
+    "top_k": 5,
+    "pick_gap_ms": 100,
+    "route_by_model": true,
+
+    "retry_429_times": 5,
+    "retry_429_wait": 60,
+    "retry_429_wait_max": 120,
+    "retry_5xx_times": 3,
+    "retry_5xx_wait": 5,
+    "cooling_seconds": 300,
+
+    "risk_cooldown_seconds": 900,
+    "risk_cooldown_max_seconds": 86400,
+    "risk_ban_strikes": 4,
+    "risk_strike_decay_seconds": 604800,
+    "risk_auto_rotate": true
+  },
+
+  "claim": {
+    "enabled": true,
+    "round_interval_seconds": 600,
+    "auto_on_add": true,
+    "cooldown_seconds": 600,
+    "max_accounts_per_round": 20
+  },
+
+  "install": {
+    "enabled": true,
+    "auto_on_add": true,
+    "timeout_seconds": 15
+  },
+
+  "guards": {
+    "reserve_credits": 0,
+    "daily_token_limit": 0,
+    "daily_credit_limit": 0,
+    "model_daily_token_limit": 0,
+    "realm_overrides": {}
+  },
+
+  "models": {
+    "aliases": {}
+  },
+
+  "session_sticky": {
+    "enabled": true,
+    "ttl_seconds": 1800,
+    "gc_interval_seconds": 300,
+    "redis_url": ""
+  },
+
+  "schedule": {
+    "checkin_hours": [9, 21],
+    "travel_hours": [9, 21],
+    "activity_hours": [10],
+    "keepalive_hours": [22],
+    "cat_hours": [1],
+    "checkin_enabled": true,
+    "travel_enabled": true,
+    "activity_enabled": true,
+    "keepalive_enabled": true,
+    "cat_enabled": true
+  },
+
+  "prompt": {
+    "mode": "custom",
+    "file": "",
+    "default_text": "You are a helpful assistant."
+  },
+
+  "features": {
+    "sanitize_blacklist_fingerprints": true,
+    "compress_long_context": true,
+    "reasoning_injection": true
+  },
+
+  "security": {
+    "admin_password_hash": "",
+    "admin_username": "admin",
+    "session_ttl_seconds": 43200,
+    "global_allowlist": [],
+    "global_blocklist": [],
+    "trust_proxy_headers": false,
+    "audit_enabled": true
+  },
+
+  "realms": {
+    "cn": {
+      "enabled": true,
+      "chat_base": "https://copilot.tencent.com",
+      "billing_base": "https://www.codebuddy.cn",
+      "models_base": ""
+    },
+    "global": {
+      "enabled": true,
+      "chat_base": "https://www.workbuddy.ai",
+      "billing_base": "https://www.workbuddy.ai",
+      "models_base": "",
+      "models_free_only": true
+    },
+    "zai": {
+      "enabled": true,
+      "chat_base": "https://api.z.ai/api/coding/paas/v4",
+      "billing_base": "https://api.z.ai/api",
+      "models_base": "https://api.z.ai/api"
+    }
+  }
+}

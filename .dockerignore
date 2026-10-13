@@ -1,0 +1,28 @@
+# 忽略构建上下文中的无关内容（缩小镜像构建上下文）
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+
+# 数据与凭证绝不进镜像
+data/
+auths/
+config.json
+.secrets/
+*.db
+*.db-wal
+*.db-shm
+
+# 前端依赖与中间产物（构建阶段单独安装）
+frontend/node_modules
+frontend/.next
+
+# 其它
+*.log
+README.md
+docs/
+tests/

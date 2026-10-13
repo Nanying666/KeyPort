@@ -1,0 +1,32 @@
+# 数据与凭证（绝不入库）
+/data/
+/auths/
+*.db
+*.db-wal
+*.db-shm
+config.json
+.secrets/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# 前端
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/tsconfig.tsbuildinfo
+frontend/install*.log
+
+# 其它
+*.log
+.DS_Store

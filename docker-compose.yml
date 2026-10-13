@@ -1,0 +1,29 @@
+services:
+  keyport:
+    build: .
+    image: keyport:latest
+    container_name: keyport
+    restart: unless-stopped
+    ports:
+      - "8790:8790"
+    volumes:
+      # 持久化：账号池状态、SQLite、凭证文件、配置（热改后写回宿主机）
+      - ./data:/app/data
+      - ./auths:/app/auths
+    environment:
+      # 配置与数据都落在持久化卷里，避免 config.json 绑定挂载的踩坑
+      - KP_CONFIG_FILE=/app/data/config.json
+      - KP_LISTEN_PORT=8790
+      # 反代后开启（信任 X-Forwarded-For；务必确保只有你的反代能直连本服务）
+      - KP_SECURITY__TRUST_PROXY_HEADERS=false
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8790/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

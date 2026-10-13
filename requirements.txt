@@ -1,0 +1,10 @@
+# KeyPort 运行依赖（Python 3.11+）
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+httpx>=0.27.0
+pydantic>=2.9.0
+python-multipart>=0.0.12
+
+# zcode.z.ai Coding Plan 端点的人机验证参数求解（可选，未安装则该端点不可用）。
+# 安装后还需下载浏览器：playwright install chromium（或直接指定本机 Chrome 路径）。
+playwright>=1.48.0

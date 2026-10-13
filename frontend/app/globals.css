@@ -1,0 +1,323 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   KeyPort · 控制室（深色单主题）
+   设计系统见 .interface-design/system.md
+
+   token 按产品世界命名（机架 / 指示灯 / 计量表）。旧名（--card / --muted /
+   --primary …）保留为别名并映射到新色板，使既有页面的内联 hsl(var(--x))
+   无需改动即可换装；新组件一律用新名。
+   ========================================================================== */
+
+:root {
+  /* 原生控件（select 下拉、滚动条、日期选择器）跟随深色渲染。
+     缺这一条时 <select> 会按浅色绘制，与深色面板割裂。 */
+  color-scheme: dark;
+
+  /* —— 表面：机箱内壁 → 面板 → 凹陷区 ——
+     ui-ux-pro-max 色板（slate 深阶）。全部对比度已实测：
+     最低组合 fault/on-well = 5.97:1，高于 WCAG AA 的 4.5:1。 */
+  --surface: 228 84% 4.9%;     /* #020617 页面底 */
+  --panel: 228 43% 9.6%;       /* #0E1223 卡片/面板 */
+  --rail: 222 47% 8.4%;        /* #0B1120 侧边导航轨道 */
+  --well: 228 29% 14.3%;       /* #1A1E2F 凹陷区（表头、输入框底） */
+
+  /* —— 文字三档 —— */
+  --ink: 210 40% 98%;          /* #F8FAFC 主文字 */
+  --ink-dim: 212 27% 83.9%;    /* #CBD5E1 次要文字 */
+  --ink-faint: 215 20% 65.1%;  /* #94A3B8 标签（AA 达标，可作 10px 小字） */
+
+  /* —— 边框：层级靠它，不靠阴影 —— */
+  --edge: 215 25% 26.7%;       /* #334155 发丝边框 */
+  --edge-strong: 215 19% 34.5%;/* #475569 强调边框/分隔 */
+
+  /* —— 信号色 —— */
+  --signal: 142 71% 45.3%;     /* #22C55E 健康 / 可用 / 主操作 */
+  --caution: 43 96% 56.3%;     /* #FBBF24 降级 / 接近限额 */
+  --fault: 0 91% 70.8%;        /* #F87171 错误 / 禁用 / 破坏性 */
+  --live: 187 86% 53.3%;       /* #22D3EE 进行中 / 在途 */
+
+  /* 主按钮上的文字色：深底压在 --signal 上，实测 7.83:1。
+     不能用 --ink（白字压绿仅 1.9:1，不可读）。 */
+  --on-signal: 222 47% 11.2%;  /* #0F172A */
+
+  --radius: 6px;
+
+  /* —— z-index 固定层级（禁止任意值） —— */
+  --z-dropdown: 30;
+  --z-modal: 40;
+  --z-toast: 50;
+
+  /* —— 旧名别名（向后兼容，勿在新代码使用） —— */
+  --background: var(--surface);
+  --foreground: var(--ink);
+  --card: var(--panel);
+  --muted: var(--well);
+  --muted-foreground: var(--ink-dim);
+  --border: var(--edge);
+  --primary: var(--signal);
+  --primary-foreground: var(--on-signal);
+  --success: var(--signal);
+  --warning: var(--caution);
+  --danger: var(--fault);
+}
+
+* {
+  border-color: hsl(var(--edge));
+}
+
+body {
+  background-color: hsl(var(--surface));
+  color: hsl(var(--ink));
+  font-family: var(--font-sans), ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
+    'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 数据一律等宽 + 表格数字，保证列对齐。
+   JetBrains Mono 缺字形（中文标点、CJK）时回落到系统 mono，不会漏字。 */
+.mono,
+.num {
+  font-family: var(--font-mono), ui-monospace, 'SF Mono', Menlo, Consolas,
+    'PingFang SC', monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'zero' 1; /* 0 带斜杠，与 O 区分 */
+}
+
+/* 全大写小标签：唯一的 letter-spacing 例外 */
+.eyebrow {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: hsl(var(--ink-faint));
+}
+
+/* ---------- 面板 ---------- */
+.card {
+  background-color: hsl(var(--panel));
+  border: 1px solid hsl(var(--edge));
+  border-radius: var(--radius);
+}
+
+/* ---------- 按钮 ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  height: 32px;
+  border-radius: 4px;
+  padding: 0 0.75rem;
+  font-size: 12.5px;
+  font-weight: 500;
+  transition: background-color 0.15s ease-out, border-color 0.15s ease-out,
+    color 0.15s ease-out;
+  cursor: pointer;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px hsl(var(--surface)), 0 0 0 3.5px hsl(var(--signal) / 0.6);
+}
+
+.btn-primary {
+  background-color: hsl(var(--signal));
+  color: hsl(var(--on-signal));
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) { background-color: hsl(var(--signal) / 0.88); }
+
+.btn-ghost {
+  background-color: transparent;
+  color: hsl(var(--ink-dim));
+  border-color: hsl(var(--edge));
+}
+.btn-ghost:hover:not(:disabled) {
+  background-color: hsl(var(--well));
+  color: hsl(var(--ink));
+}
+
+.btn-danger {
+  background-color: transparent;
+  color: hsl(var(--fault));
+  border-color: hsl(var(--fault) / 0.4);
+}
+.btn-danger:hover:not(:disabled) {
+  background-color: hsl(var(--fault) / 0.14);
+  border-color: hsl(var(--fault) / 0.7);
+}
+
+.btn-outline {
+  border-color: hsl(var(--edge-strong));
+  background: transparent;
+  color: hsl(var(--ink-dim));
+}
+.btn-outline:hover:not(:disabled) {
+  background-color: hsl(var(--well));
+  color: hsl(var(--ink));
+}
+
+/* ---------- 输入 ---------- */
+.input {
+  width: 100%;
+  height: 32px;
+  border-radius: 4px;
+  border: 1px solid hsl(var(--edge));
+  background-color: hsl(var(--well));
+  color: hsl(var(--ink));
+  padding: 0 0.6rem;
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.15s ease-out;
+}
+.input::placeholder { color: hsl(var(--ink-faint)); }
+.input:focus { border-color: hsl(var(--signal) / 0.7); }
+.input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+textarea.input { height: auto; padding: 0.45rem 0.6rem; line-height: 1.5; }
+select.input {
+  cursor: pointer;
+  /* 原生下拉箭头在深色下需要留出右侧空间，并统一背景 */
+  appearance: none;
+  padding-right: 1.6rem;
+  background-image: linear-gradient(45deg, transparent 50%, hsl(var(--ink-faint)) 50%),
+    linear-gradient(135deg, hsl(var(--ink-faint)) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 14px, calc(100% - 9px) 14px;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+/* ---------- 标签 ---------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border-radius: 3px;
+  padding: 0.1rem 0.4rem;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* ---------- 表格 ---------- */
+table.data { width: 100%; border-collapse: collapse; font-size: 12px; }
+/* 列多时（日志 13 列、账号 10 列）需要最小宽度兜底：
+   否则浏览器把列压到内容宽度以下，whitespace-nowrap 的操作按钮
+   会撑破容器被裁掉。配合外层 overflow-x-auto 产生横向滚动。 */
+table.data { min-width: max-content; }
+table.data th {
+  text-align: left;
+  padding: 0 0.7rem;
+  height: 30px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: hsl(var(--ink-faint));
+  background-color: hsl(var(--well));
+  border-bottom: 1px solid hsl(var(--edge));
+  white-space: nowrap;
+}
+table.data td {
+  padding: 0 0.7rem;
+  height: 34px;
+  border-bottom: 1px solid hsl(var(--edge) / 0.6);
+  vertical-align: middle;
+  color: hsl(var(--ink-dim));
+}
+table.data tbody tr:last-child td { border-bottom: none; }
+table.data tr:hover td {
+  background-color: hsl(var(--well) / 0.55);
+  color: hsl(var(--ink));
+}
+
+/* 列多时（账号 10 列、密钥 10 列）操作列会被推到横向滚动区外，
+   默认视口看不到「刷额度/摘除/删除」等主操作。将末列吸附在右侧常驻可见。
+   注意：sticky 单元格必须用不透明底色，否则会透出横向滚过的其他列内容。 */
+table.data.has-actions th:last-child,
+table.data.has-actions td:last-child {
+  position: sticky;
+  right: 0;
+  background-color: hsl(var(--panel));
+  box-shadow: -1px 0 0 hsl(var(--edge));
+}
+table.data.has-actions th:last-child { background-color: hsl(var(--well)); }
+table.data.has-actions tr:hover td:last-child { background-color: hsl(var(--well)); }
+
+/* ---------- 指示灯（唯一的“光效”，模拟真实指示灯） ---------- */
+.lamp {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+}
+.lamp-ok { background-color: hsl(var(--signal)); box-shadow: 0 0 6px hsl(var(--signal) / 0.5); }
+.lamp-warn { background-color: hsl(var(--caution)); box-shadow: 0 0 6px hsl(var(--caution) / 0.5); }
+.lamp-bad { background-color: hsl(var(--fault)); box-shadow: 0 0 6px hsl(var(--fault) / 0.5); }
+.lamp-idle { background-color: hsl(var(--ink-faint)); }
+
+/* ---------- 配额液位 ---------- */
+.meter {
+  height: 4px;
+  border-radius: 2px;
+  background-color: hsl(var(--well));
+  overflow: hidden;
+  display: block;
+}
+.meter > i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background-color: hsl(var(--signal));
+  transition: width 0.2s ease-out;
+}
+.meter > i.warn { background-color: hsl(var(--caution)); }
+.meter > i.bad { background-color: hsl(var(--fault)); }
+
+/* ---------- 分段控件（时间范围切换） ---------- */
+.seg {
+  display: inline-flex;
+  border: 1px solid hsl(var(--edge));
+  border-radius: 4px;
+  overflow: hidden;
+}
+.seg > button {
+  height: 28px;
+  padding: 0 0.6rem;
+  font-size: 11.5px;
+  color: hsl(var(--ink-dim));
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.15s ease-out, color 0.15s ease-out;
+}
+.seg > button + button { border-left: 1px solid hsl(var(--edge)); }
+.seg > button:hover { background-color: hsl(var(--well)); color: hsl(var(--ink)); }
+.seg > button[data-on='true'] {
+  background-color: hsl(var(--signal) / 0.16);
+  color: hsl(var(--signal));
+  font-weight: 600;
+}
+
+/* ---------- 减动效 ----------
+   前庭功能障碍用户在开启「减少动态效果」后不应看到位移类动画。
+   保留 opacity 与 color 过渡（不产生位移，且是状态反馈），
+   只掐掉 transform 动画与骨架屏脉冲。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

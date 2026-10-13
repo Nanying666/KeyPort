@@ -1,0 +1,40 @@
+"""依赖注入：把网关组件挂到 FastAPI 的 app.state 上，并提供取用函数。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from fastapi import Request
+
+from ..api.gateway import Gateway
+from ..api.models import ModelRegistry
+from ..config import Config
+from ..db import Database
+
+
+@dataclass
+class AppContext:
+    """进程级组件容器。"""
+
+    cfg: Config
+    db: Database
+    pool: Any
+    client: Any
+    refresher: Any
+    key_store: Any
+    request_logger: Any
+    gateway: Gateway
+    models: ModelRegistry
+    scheduler: Any = None
+    captcha: Any = None
+    claims: Any = None
+    login_states: dict[str, Any] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.login_states is None:
+            self.login_states = {}
+
+
+def get_ctx(request: Request) -> AppContext:
+    return request.app.state.ctx
