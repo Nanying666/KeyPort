@@ -91,10 +91,15 @@ export interface AccountView {
   /** 风控（3012 / unusual activity）命中计数；窗口内累计到阈值会升级禁用 */
   risk_strikes: number;
   last_risk_at: number;
-  /** 每账号设备档案（成套桌面 SKU + device_mid，一号一台设备） */
+  /** 每账号设备档案（成套桌面 SKU + device_mid，一号一台设备）。
+   *  **仅 ZCode 平台账号持有**；WorkBuddy / CodeBuddy 恒为空对象。 */
   fingerprint: AccountFingerprint;
-  /** 官方首启安装序完成时间（0 = 未完成） */
+  /** 官方首启安装序完成时间（0 = 未完成）；仅 ZCode 平台账号有意义 */
   installed_at: number;
+  /** 是否为 ZCode 平台账号（realm=zai 且端点指向 Coding Plan 网关）。
+   *  管理台据此分两个列表：false → WorkBuddy/CodeBuddy 池，
+   *  true → ZCode 池（后者才展示设备档案与安装序）。 */
+  zcode_platform: boolean;
 }
 
 export interface ClaimPlanGrant {

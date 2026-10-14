@@ -429,20 +429,40 @@ ZCode Coding Plan 的活动套餐（`billing/preview` → `billing/claim`）双�
 
 #### 账号管理（`/accounts`）
 
-![账号管理](docs/images/02-accounts.png)
+账号分成**两个池、两张列表**，因为这是两套完全不同的上游身份体系：
 
-- 状态四档着色（正常 / 冷却 / 熔断 / 已禁用），Token 有效期另按
-  已过期 / 即将过期 / 偏紧 / 健康分档。
-- **设备档案列**：显示该账号被分配到的成套桌面 SKU（平台-架构 + 分辨率）
-  与安装序状态（已安装 / 未安装）—— 一号一台设备的可视化依据。
+| 池 | 身份机制 | 出站头 | 设备档案 / 安装序 |
+|---|---|---|---|
+| **WorkBuddy / CodeBuddy** | 按 uid 稳定派生 | `X-Machine-ID` / `X-Session-ID`（36 hex） | ✗ 不适用 |
+| **ZCode**（z.ai Coding Plan） | 成套桌面 SKU | `x-platform` / `x-os-version` / `x-os-category` / `x-client-*` / `x-device-mid` | ✓ 有 |
+
+![账号管理 · WorkBuddy / CodeBuddy 池](docs/images/02-accounts-wb.png)
+
+WorkBuddy / CodeBuddy 池：只有状态、额度与调用统计。它们的请求里**根本不带 SKU
+字段**，所以既没有「设备档案」列，也没有安装序 / 换设备操作 —— 列出来只会让人
+误以为它们在走桌面指纹。
+
+![账号管理 · ZCode 池](docs/images/03-accounts-zcode.png)
+
+ZCode 池额外带**设备档案列**（平台-架构 + 分辨率 + 安装状态）与「安装 / 换设备」
+操作，因为 Coding Plan 端点确实按这些字段判身份：
+
+- **设备档案**：该账号被分配到的成套桌面 SKU（`win32-x64 / 1920x1080`）——
+  一号一台设备的可视化依据，后台可换发（新 SKU + 新 `device_mid`）。
+- **补跑安装序**：官方首启序（`client/configs` + 激活事件上报），幂等。
 - **风控命中次数**（`风控 ×N`）：窗口内累计到阈值会升级禁用。
-- 操作：刷额度、**补跑安装序**、**换发设备**（新 SKU + 新 `device_mid`）、
-  摘除 / 放回池、恢复、删除。
-- 顶部：按域筛选、导入 / 导出、扫描 `auths/`、API Key 纳管、OAuth 登录。
+
+两池共有的：状态四档着色（正常 / 冷却 / 熔断 / 已禁用）、Token 有效期四档
+（已过期 / 即将过期 / 偏紧 / 健康）、刷额度、摘除 / 放回池、恢复、删除。
+顶部：导入 / 导出、扫描 `auths/`、API Key 纳管、OAuth 登录。
+
+> 池的划分由后端 `zcode_platform` 标记决定（判据是 `realm=zai` **且**端点落在
+> Coding Plan 网关下），前端不猜。对非 ZCode 账号执行「换设备」会返回 400
+> 并说明原因，而不是假装成功。
 
 #### 密钥管理（`/keys`）
 
-![密钥管理](docs/images/03-keys.png)
+![密钥管理](docs/images/04-keys.png)
 
 多密钥分发：每把密钥独立设域、模型白名单、积分与 Token 配额、IP 白 / 黑名单；
 创建 / 启停 / 删除即时生效，可对任一密钥**清零**已用量。
@@ -450,7 +470,7 @@ ZCode Coding Plan 的活动套餐（`billing/preview` → `billing/claim`）双�
 
 #### 调用日志（`/logs`）
 
-![调用日志](docs/images/04-logs.png)
+![调用日志](docs/images/05-logs.png)
 
 逐行标明调用密钥（`key=` 列）、协议、上游模型、状态码、首字延迟（TTFB）、
 总耗时、Token 计量、重试次数与来源 IP。TTFB 是「发起上游请求到收到第一个含
@@ -458,7 +478,7 @@ ZCode Coding Plan 的活动套餐（`billing/preview` → `billing/claim`）双�
 
 #### 用量统计（`/usage`）
 
-![用量统计](docs/images/05-usage.png)
+![用量统计](docs/images/06-usage.png)
 
 按天 / 按模型 / 按密钥多维统计 Token 消耗（支持近 7 / 30 天窗口切换），
 并**直读上游真实账单快照**。注意这里并列两种口径：本地逐请求记账（准确、
@@ -467,7 +487,7 @@ ZCode Coding Plan 的活动套餐（`billing/preview` → `billing/claim`）双�
 
 #### 任务调度（`/tasks`）
 
-![任务调度](docs/images/06-tasks.png)
+![任务调度](docs/images/07-tasks.png)
 
 - **排程配置**：签到 / 旅行 / 成长 / 保活 / 夜猫五类任务独立开关与执行时刻，
   逗号分隔的小时列表（本地时区），失焦即保存并热生效。
@@ -478,7 +498,7 @@ ZCode Coding Plan 的活动套餐（`billing/preview` → `billing/claim`）双�
 
 #### 聊天测试台（`/playground`）
 
-![聊天测试台](docs/images/07-playground.png)
+![聊天测试台](docs/images/08-playground.png)
 
 不建密钥直接试调模型，可选域 / 模型 / 推理强度，显示思考过程、每次扣费与
 Token，右下角累计本次会话消耗。请求经管理端登录态转发（与下游同一账号池），
@@ -486,7 +506,7 @@ Token，右下角累计本次会话消耗。请求经管理端登录态转发（
 
 #### 系统设置（`/settings`）
 
-![系统设置](docs/images/08-settings.png)
+![系统设置](docs/images/09-settings.png)
 
 - **提示词与脱敏**：`custom` / `passthrough` / `append` 三种模式、
   指纹脱敏、长上下文压缩、思维链注入。

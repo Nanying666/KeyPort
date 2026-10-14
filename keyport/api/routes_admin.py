@@ -23,7 +23,7 @@ from ..auth.zcode import is_zcode_bundle
 from ..config import save_config
 from ..db import now as db_now
 from ..upstream.base import UpstreamError
-from ..upstream.claim import ClaimError
+from ..upstream.claim import ClaimError, is_zcode_plan_account
 from .admin_auth import SESSION_COOKIE, bootstrap_admin_password, client_ip, require_admin
 from .deps import get_ctx
 from .logging import record_audit
@@ -149,6 +149,9 @@ def _account_view(ctx, entry) -> dict[str, Any]:
         "last_risk_at": entry.last_risk_at,
         "fingerprint": dict(entry.fingerprint or {}),
         "installed_at": entry.installed_at,
+        # ZCode 平台标记：管理台据此把账号分到两个列表
+        # （WorkBuddy / CodeBuddy 池 vs ZCode 池，后者才带设备档案与安装序）
+        "zcode_platform": is_zcode_plan_account(ctx.pool.auth_for(entry)),
     }
 
 
@@ -667,18 +670,29 @@ async def rotate_fingerprint(uid: str, request: Request, _: str = Depends(requir
     """换发全新设备档案（新 SKU + 新 device_mid），并清空安装序幂等位。
 
     风控命中后使用：账号重新启用时已是全新设备身份。
+    **仅 ZCode 平台账号持有设备档案**；WorkBuddy / CodeBuddy 返回 400 说明原因
+    （它们的身份是 `X-Machine-ID`，换 SKU 毫无作用），而不是假装成功。
     """
     ctx = get_ctx(request)
     profile = ctx.pool.rotate_fingerprint(uid)
     if profile is None:
         raise HTTPException(status_code=404, detail="账号不存在")
+    if not profile:
+        raise HTTPException(
+            status_code=400,
+            detail="非 ZCode 平台账号，不持有设备档案（其身份为 X-Machine-ID，无需换发）",
+        )
     record_audit(ctx.db, client_ip(request), "account_rotate_fingerprint", uid, "ok")
     return {"ok": True, "uid": uid, "fingerprint": profile}
 
 
 @router.post("/accounts/{uid}/install")
 async def run_install(uid: str, request: Request, _: str = Depends(require_admin)):
-    """手动补跑官方首启安装序（client/configs + 激活事件上报）。"""
+    """手动补跑官方首启安装序（client/configs + 激活事件上报）。
+
+    **仅 ZCode 平台账号**：安装序模拟的是 ZCode 桌面端首启行为。非 ZCode 账号
+    返回 `skipped=True`（零上游请求），前端据此提示而不是显示「成功」。
+    """
     ctx = get_ctx(request)
     entry = ctx.pool.get(uid)
     if entry is None:

@@ -492,15 +492,32 @@ class AccountPool:
     def upsert_account(self, auth: AccountAuth) -> AccountEntry:
         """新增或更新账号凭证（OAuth 登录 / 扫码纳管 / 导入共用入口）。
 
-        新增账号时分配**成套桌面 SKU 设备档案**（一号一台设备，全新 device_mid）：
-        绝不沿用宿主机真实形态 —— 多账号共用同一云内核+分辨率会在上游形成
-        「一台机房机器开了 N 个账号」的关联信号。
+        设备档案**只给 ZCode 平台账号分配**（`realm=zai` 且 base_url 指向
+        Coding Plan 网关）：
+
+        - **ZCode Coding Plan** 的出站头逐个字段用桌面 SKU
+          （`x-platform` / `x-os-version` / `x-os-category` / `x-client-*` /
+          `x-device-mid`），官方首启安装序与激活事件也按该档案上报 ——
+          没有档案就没有可用的设备身份。
+        - **WorkBuddy / CodeBuddy** 认的是 `X-Machine-ID` / `X-Session-ID`
+          （按 uid 稳定派生，见 `derive_machine_id`），请求里根本不带 SKU
+          字段。给它们分配 SKU 只会让后台展示出「用不上的设备档案」，
+          反而误导运维以为它们在走桌面指纹。
+
+        因此非 ZCode 账号的 `fingerprint` 保持空 dict，后台显示「—」。
         """
+        from ..upstream.claim import is_zcode_plan_account
+
+        wants_sku = is_zcode_plan_account(auth)
         with self._lock:
             existing = self._entries.get(auth.uid)
             fingerprint = dict(existing.fingerprint or {}) if existing else {}
-            if not fingerprint:
+            if wants_sku and not fingerprint:
                 fingerprint = assign_fingerprint(auth).to_dict()
+            elif not wants_sku:
+                # 非 ZCode 账号不需要档案；顺带清掉历史遗留的（例如账号端点
+                # 被改成非 Coding Plan 后，旧 SKU 已无意义）
+                fingerprint = {}
             self.db.execute(
                 """
                 INSERT INTO accounts(uid, realm, nickname, enterprise_id, domain, access_token,
@@ -554,12 +571,20 @@ class AccountPool:
 
         风控升级禁用后调用：账号重新启用时已是全新设备身份。换发同时清空
         `installed_at`，让安装序在新设备上重跑。
+
+        非 ZCode 账号（WorkBuddy / CodeBuddy）不持有设备档案，也不该换发 ——
+        它们的身份是 `X-Machine-ID`（按 uid 派生），换 SKU 毫无作用。
+        这类账号返回空 dict（调用方据此提示，而不是假装换发成功）。
         """
+        from ..upstream.claim import is_zcode_plan_account
+
         with self._lock:
             entry = self._entries.get(uid)
             if entry is None:
                 return None
             auth = self.auth_for(entry)
+            if not is_zcode_plan_account(auth):
+                return {}
             profile: DeviceProfile = rotate_fingerprint(auth)
             entry.fingerprint = profile.to_dict()
             entry.installed_at = 0

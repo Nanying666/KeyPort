@@ -35,9 +35,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # 页面清单：(文件名, 路由, 说明)。顺序即 README 里的展示顺序。
+#
+# `tabs` 非空时表示该页有池页签需要分别截图（账号管理分
+# WorkBuddy/CodeBuddy 与 ZCode 两个池，列表列与操作不同，必须各截一张）。
 PAGES: tuple[tuple[str, str, str], ...] = (
     ("overview", "/", "概览"),
-    ("accounts", "/accounts", "账号管理"),
+    ("accounts-wb", "/accounts", "账号管理 · WorkBuddy/CodeBuddy 池"),
+    ("accounts-zcode", "/accounts", "账号管理 · ZCode 池"),
     ("keys", "/keys", "密钥管理"),
     ("logs", "/logs", "调用日志"),
     ("usage", "/usage", "用量统计"),
@@ -45,6 +49,12 @@ PAGES: tuple[tuple[str, str, str], ...] = (
     ("playground", "/playground", "聊天测试台"),
     ("settings", "/settings", "系统设置"),
 )
+
+# 需要切换页签的页面：路由 → [(文件名后缀, 页签序号)]。
+# 账号管理页第一个页签是 WorkBuddy/CodeBuddy，第二个是 ZCode。
+TAB_PAGES: dict[str, list[tuple[str, int]]] = {
+    "/accounts": [("wb", 0), ("zcode", 1)],
+}
 
 # 需要读出来做脱敏的 API（登录后直接查，未拦截）
 DISCOVERY_APIS = (
@@ -315,25 +325,40 @@ def main(argv: list[str] | None = None) -> int:
         for i, (slug, route, label) in enumerate(PAGES, start=1):
             url = f"{base}{route}"
             target = out_dir / f"{i:02d}-{slug}.png"
+            suffix = slug.split("-")[-1] if "-" in slug else ""
             try:
                 page.goto(url, wait_until="networkidle", timeout=30000)
                 # 轮询组件（概览/账号/任务页都有定时刷新）先等一轮数据落定
                 time.sleep(args.settle)
+
+                # 有池页签的页面：点到对应页签再截（两池的列与操作不同）
+                tab_index = None
+                for suffix_key, idx in TAB_PAGES.get(route, []):
+                    if suffix_key == suffix:
+                        tab_index = idx
+                        break
+                if tab_index is not None:
+                    tabs = page.query_selector_all("div.mb-3 button")
+                    if tab_index < len(tabs):
+                        tabs[tab_index].click()
+                        time.sleep(1.2)  # 等列表重渲染
+                    else:
+                        raise RuntimeError(f"页签 #{tab_index} 不存在（找到 {len(tabs)} 个）")
+
                 # 撑高视口以容纳长页面（外壳是内部滚动布局，full_page 够不到折下内容）
                 height = _fit_viewport(page)
                 page.screenshot(path=str(target), full_page=True)
                 size_kb = target.stat().st_size / 1024
-                print(f"  [{i}/{len(PAGES)}] {label:<8} {route:<12} → {target.name} "
+                print(f"  [{i}/{len(PAGES)}] {label:<26} {route:<12} → {target.name} "
                       f"({size_kb:.0f} KB, {VIEWPORT['width']}x{height})")
             except Exception as exc:  # noqa: BLE001 - 单页失败不中断整体
                 failures.append(f"{label} ({route}): {exc}")
-                print(f"  [{i}/{len(PAGES)}] {label:<8} 失败: {exc}")
+                print(f"  [{i}/{len(PAGES)}] {label:<26} 失败: {exc}")
             finally:
                 # 恢复默认视口，避免上一页的尺寸影响下一页布局
                 page.set_viewport_size(VIEWPORT)
 
         browser.close()
-
     if failures:
         print("\n失败的页面：", file=sys.stderr)
         for f in failures:
