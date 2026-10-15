@@ -28,12 +28,6 @@ log = logging.getLogger("keyport.scheduler")
 
 TASKS = ("checkin", "travel", "activity", "keepalive", "cat", "web_active")
 
-# 成长任务行为事件（上报即点亮）
-GROWTH_EVENTS = (
-    "open_app", "send_message", "use_tool", "view_profile",
-    "daily_active", "share_content", "complete_profile", "invite_friend",
-)
-
 
 def _daily_chat_done(entry: Any, now: float | None = None) -> bool:
     """国际版每日活跃打卡今天是否已完成（按自然日去重）。

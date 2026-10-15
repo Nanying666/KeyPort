@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -338,6 +339,38 @@ async def test_acp_set_model_failure_is_not_fatal():
 
     assert result["ok"] is True
     assert any("设置模型" in m for m in logged)
+
+
+@pytest.mark.asyncio
+async def test_channel_close_swallows_cancelled_error():
+    """`close()` 取消读取任务后必须吞掉 `CancelledError`。
+
+    `CancelledError` **不是** `Exception` 的子类 —— 只 `suppress(Exception)`
+    会让取消抛穿到调用方，把一次正常的收尾变成异常。
+    """
+    up = _Upstream()
+    async with _raw_client(up) as http:
+        channel = webagent.AcpChannel(http, SANDBOX, "t", "")
+
+        async def _never() -> None:
+            await asyncio.sleep(3600)
+
+        channel._reader = asyncio.create_task(_never())
+        await channel.close(grace=0.01)  # 不该抛
+        assert channel._reader is None
+
+
+@pytest.mark.asyncio
+async def test_run_turn_requires_poll_status():
+    """`poll_status` 是必填的：没有它永远无法认定「跑完了」，实现只能一律报超时。
+
+    用签名断言（而非调用断言）—— 这是接口约束，不是运行时行为。
+    """
+    import inspect
+
+    params = inspect.signature(webagent.run_turn).parameters
+    assert params["poll_status"].default is inspect.Parameter.empty
+    assert params["poll_status"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # ---- 打卡总入口 ----

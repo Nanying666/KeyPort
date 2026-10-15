@@ -651,12 +651,6 @@ class UpstreamClient:
             auth, ["/v2/billing/activity/travel", "/billing/activity/travel"], {}
         )
 
-    async def activity_event(self, auth: AccountAuth, event: str) -> dict[str, Any]:
-        """成长任务行为事件上报（点亮任务并领奖）。"""
-        return await self._billing_post(
-            auth, ["/v2/report/activity/event", "/report/activity/event"], {"event": event}
-        )
-
     # ---- growth 域原语（实现见 upstream/growth.py）----
     #
     # 这里只做转发：原语层需要 `client_for` / `_billing_base` / `billing_headers`

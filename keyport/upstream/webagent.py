@@ -150,8 +150,12 @@ class AcpChannel:
                     self.updates += 1
                     if update.get("sessionUpdate") == "agent_message_chunk":
                         self.chunks += 1
-        except (httpx.HTTPError, asyncio.CancelledError):
-            pass  # 连接被关掉 / 主动取消：正常收尾路径
+        except asyncio.CancelledError:
+            # 取消要**照常向上传**（吞掉它会让本任务假装「正常结束」，
+            # 调用方 await 时拿不到取消信号）
+            raise
+        except Exception:  # noqa: BLE001, S110 - 连接被关掉/超时等都属正常收尾路径
+            pass
 
     async def request(self, method: str, params: dict[str, Any], request_id: int) -> int:
         """发一个 JSON-RPC 请求；返回 HTTP 状态码（正常是 202）。"""
@@ -192,7 +196,9 @@ class AcpChannel:
                 await asyncio.wait_for(asyncio.shield(reader), timeout=grace)
         if reader is not None and not reader.done():
             reader.cancel()
-            with contextlib.suppress(Exception):
+            # `CancelledError` **不是** `Exception` 的子类：只写 suppress(Exception)
+            # 抓不住它，取消读取任务后 await 会把取消抛穿到调用方。
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await reader
         if response is not None:
             with contextlib.suppress(Exception):
@@ -228,10 +234,10 @@ async def run_turn(
     link: str,
     token: str,
     session_id: str,
-    cwd: str = "/workspace",
+    poll_status: Callable[[], Awaitable[str]],
     prompt: str,
+    cwd: str = "/workspace",
     user_agent: str = "",
-    poll_status: Callable[[], Awaitable[str]] | None = None,
     wait_seconds: float = 120.0,
     poll_interval: float = 3.0,
     model: str = "",
@@ -240,9 +246,11 @@ async def run_turn(
     """接上沙箱、把这一轮跑完；返回结果字典。
 
     `poll_status` 是调用方给的「这条会话现在什么状态」（查 console API）：看到
-    `completed` 就算跑完，`failed`/`error` 直接停。返回里带事件数与输出段数，
-    方便在打卡结果里一眼看出**到底跑没跑**（光看「成功」分不清是真跑完了，
-    还是只有桌面腿过了）。
+    `completed` 就算跑完，`failed`/`error` 直接停。**它是必填的** —— 判据只有
+    会话状态一个来源，没有它就永远无法认定「这一轮跑完了」，实现只能一律报超时。
+
+    返回里带事件数与输出段数，方便在打卡结果里一眼看出**到底跑没跑**
+    （光看「成功」分不清是真跑完了，还是只有桌面腿过了）。
     """
     log = log or (lambda *a, **k: None)
     started = time.monotonic()
@@ -272,17 +280,16 @@ async def run_turn(
 
         deadline = time.monotonic() + max(1.0, float(wait_seconds))
         while time.monotonic() < deadline:
-            if poll_status is not None:
-                try:
-                    status = str(await poll_status() or "")
-                except Exception as exc:  # noqa: BLE001 - 查状态失败不该中断等待
-                    log("状态查询失败（%s）", exc)
-                if status == STATUS_COMPLETED:
-                    finished = True
-                    break
-                if status in STATUS_FAILED:
-                    error = f"会话状态={status}"
-                    break
+            try:
+                status = str(await poll_status() or "")
+            except Exception as exc:  # noqa: BLE001 - 查状态失败不该中断等待
+                log("状态查询失败（%s）", exc)
+            if status == STATUS_COMPLETED:
+                finished = True
+                break
+            if status in STATUS_FAILED:
+                error = f"会话状态={status}"
+                break
             if poll_interval > 0:
                 await asyncio.sleep(poll_interval)
     except AcpError as exc:
@@ -293,7 +300,7 @@ async def run_turn(
         await channel.close()
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    if not status and poll_status is not None:
+    if not status:
         with contextlib.suppress(Exception):
             status = str(await poll_status() or "")
     if not finished and not error:
