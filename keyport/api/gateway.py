@@ -592,6 +592,12 @@ class ChatSession:
         tokens = int(u.get("total_tokens") or 0)
         if not credits:
             credits = extract_credits(u)
+        # 当日积分预算闸：只统计**观测到**的扣费（上游 usage 缺 credit 时不计数）——
+        # 把「没观测到」当 0 会让用量永远涨不上去、闸形同虚设。
+        budget = getattr(self.gateway, "budget", None)
+        if budget is not None:
+            observed = any(k in u for k in ("credit", "credits", "cost", "totalCredit"))
+            budget.add(credits, observed)
         if self.auth is not None and not self.error:
             self.gateway.pool.record_success(
                 self.uid, credits_used=credits, realm=self.params.realm,
@@ -655,6 +661,8 @@ class Gateway:
         self.waf_gate = WafIpGate()
         # 进程停机信号：换号退避等待可被取消（优雅停机不必等退避睡醒）
         self.stop_event: asyncio.Event | None = None
+        # 当日积分预算闸（由 app 装配注入；None = 未接线，闸不生效）
+        self.budget: Any = None
 
     def realm_chain(self, model_id: str, explicit: str = "") -> list[str]:
         """选号域链（优先 → 兜底）；元素为空串表示「不限域」。

@@ -27,10 +27,13 @@ router = APIRouter(prefix="/v1", tags=["gateway"])
 
 
 class AuthFailure(Exception):
-    def __init__(self, status: int, message: str, err_type: str = "invalid_request_error"):
+    def __init__(self, status: int, message: str, err_type: str = "invalid_request_error",
+                 headers: dict[str, str] | None = None):
         self.status = status
         self.message = message
         self.err_type = err_type
+        # 附加响应头（如 429 的 `Retry-After`）—— 下游据此退避，别让客户端硬撞
+        self.headers = headers or {}
 
 
 def _extract_key(authorization: str, x_api_key: str) -> str:
@@ -78,6 +81,33 @@ def _authorize(request: Request, authorization: str, x_api_key: str):
         raise AuthFailure(429, "该密钥积分配额已用尽", "rate_limit_error")
     if ctx_key.tokens_exhausted():
         raise AuthFailure(429, "该密钥 Token 配额已用尽", "rate_limit_error")
+
+    # 客户端维度限流：按 Key ID 计数（换 Key 即换桶，符合「客户端」语义）。
+    # 放在鉴权之后 —— 那时才拿得到 Key ID；无 Key 实体时退化为按客户端 IP。
+    rpm = int(getattr(cfg.pool, "rate_limit_rpm", 0) or 0)
+    if rpm > 0 and ctx.limiter is not None:
+        from ..ratelimit import bucket_for, retry_after_seconds
+
+        ok_rl, wait = ctx.limiter.allow(bucket_for(ctx_key.key_id, ip), rpm)
+        if not ok_rl:
+            secs = retry_after_seconds(wait)
+            raise AuthFailure(
+                429,
+                f"请求过于频繁：每分钟上限 {rpm} 次，请 {secs}s 后重试",
+                "rate_limit_error",
+                headers={"Retry-After": str(secs)},
+            )
+
+    # 当日积分预算闸：**全局**准入控制，达到当日累计扣费上限即停收。
+    # 放在这里（读 body 之前）—— 被拒的请求不该先把几十 MB 请求体读进内存再丢掉。
+    if ctx.budget is not None and not ctx.budget.admit():
+        snap = ctx.budget.snapshot()
+        raise AuthFailure(
+            429,
+            f"网关当日积分预算已用尽（{snap['used']:.2f}/{snap['limit']:.2f}），"
+            f"按 CST 自然日重置",
+            "rate_limit_error",
+        )
 
     return ctx, ctx_key, ip
 
@@ -168,7 +198,9 @@ async def list_models(
     try:
         ctx, ctx_key, _ = _authorize(request, authorization, x_api_key)
     except AuthFailure as exc:
-        return JSONResponse(status_code=exc.status, content=_error_body(exc.message, exc.err_type))
+        return JSONResponse(status_code=exc.status,
+                            content=_error_body(exc.message, exc.err_type),
+                            headers=exc.headers)
     realm = ctx_key.realm or ""
     models = await ctx.models.list_models(realm, refresh=bool(refresh))
     data = []
@@ -215,7 +247,9 @@ async def key_usage(
     try:
         ctx, ctx_key, _ = _authorize(request, authorization, x_api_key)
     except AuthFailure as exc:
-        return JSONResponse(status_code=exc.status, content=_error_body(exc.message, exc.err_type))
+        return JSONResponse(status_code=exc.status,
+                            content=_error_body(exc.message, exc.err_type),
+                            headers=exc.headers)
 
     def _remaining(quota: float, used: float) -> float | None:
         """剩余额度；配额为 0（不限）时返回 None（不编造数字）。"""
@@ -260,7 +294,9 @@ async def chat_completions(
     try:
         ctx, ctx_key, ip = _authorize(request, authorization, x_api_key)
     except AuthFailure as exc:
-        return JSONResponse(status_code=exc.status, content=_error_body(exc.message, exc.err_type))
+        return JSONResponse(status_code=exc.status,
+                            content=_error_body(exc.message, exc.err_type),
+                            headers=exc.headers)
 
     try:
         body = await request.json()
@@ -272,7 +308,9 @@ async def chat_completions(
     try:
         _check_model(ctx_key, bare)
     except AuthFailure as exc:
-        return JSONResponse(status_code=exc.status, content=_error_body(exc.message, exc.err_type))
+        return JSONResponse(status_code=exc.status,
+                            content=_error_body(exc.message, exc.err_type),
+                            headers=exc.headers)
 
     stream = bool(body.get("stream", False))
     params = ChatParams(
@@ -317,7 +355,9 @@ async def responses_api(
     try:
         ctx, ctx_key, ip = _authorize(request, authorization, x_api_key)
     except AuthFailure as exc:
-        return JSONResponse(status_code=exc.status, content=_error_body(exc.message, exc.err_type))
+        return JSONResponse(status_code=exc.status,
+                            content=_error_body(exc.message, exc.err_type),
+                            headers=exc.headers)
 
     try:
         raw = await request.json()
@@ -329,7 +369,9 @@ async def responses_api(
     try:
         _check_model(ctx_key, bare)
     except AuthFailure as exc:
-        return JSONResponse(status_code=exc.status, content=_error_body(exc.message, exc.err_type))
+        return JSONResponse(status_code=exc.status,
+                            content=_error_body(exc.message, exc.err_type),
+                            headers=exc.headers)
 
     openai_body = responses_proto.request_to_openai(raw)
     stream = bool(raw.get("stream", False))
@@ -395,6 +437,7 @@ async def messages_api(
         return JSONResponse(
             status_code=exc.status,
             content={"type": "error", "error": {"type": exc.err_type, "message": exc.message}},
+            headers=exc.headers,
         )
 
     try:
@@ -414,6 +457,7 @@ async def messages_api(
         return JSONResponse(
             status_code=exc.status,
             content={"type": "error", "error": {"type": exc.err_type, "message": exc.message}},
+            headers=exc.headers,
         )
 
     openai_body = anthropic.request_to_openai(raw)

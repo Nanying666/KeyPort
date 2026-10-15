@@ -30,9 +30,11 @@ from .api.routes_ops import router as ops_router
 from .api.routes_v1 import router as v1_router
 from .auth.refresh import TokenRefresher
 from .auth.store import load_auth_dir
+from .budget import DailyBudget
 from .config import Config, get_config
 from .db import init_db
 from .pool.manager import AccountPool
+from .ratelimit import ClientLimiter
 from .scheduler import Scheduler
 from .upstream.captcha import (
     DEFAULT_PREFIX,
@@ -116,8 +118,11 @@ def build_context(cfg: Config | None = None) -> AppContext:
     key_store = KeyStore(db)
     request_logger = RequestLogger(db)
     models = ModelRegistry(cfg, pool, client)
+    budget = DailyBudget(cfg.pool.budget_daily_credit_limit)
     gateway = Gateway(cfg, pool, client, refresher, key_store, request_logger,
                       models=models)
+    # 预算闸同时挂在网关（记账）与上下文（准入判定）
+    gateway.budget = budget
     scheduler = Scheduler(cfg, db, pool, client, refresher)
     # 告警数据源需要读 WAF IP 级拦截状态（该状态在网关上）
     scheduler.gateway = gateway
@@ -126,6 +131,9 @@ def build_context(cfg: Config | None = None) -> AppContext:
         cfg=cfg, db=db, pool=pool, client=client, refresher=refresher,
         key_store=key_store, request_logger=request_logger, gateway=gateway,
         models=models, scheduler=scheduler, captcha=captcha, claims=claims,
+        budget=budget,
+        limiter=ClientLimiter(),
+        started_at=time.time(),
     )
     ctx.admin_auth = AdminAuth(db, cfg)  # type: ignore[attr-defined]
     return ctx
