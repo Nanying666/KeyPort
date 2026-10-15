@@ -217,6 +217,33 @@ async def list_accounts(request: Request, _: str = Depends(require_admin)):
     }
 
 
+@router.post("/accounts/sync-nicknames")
+async def sync_nicknames(request: Request, _: str = Depends(require_admin)):
+    """同步全部账号的最新昵称（改名后免重登）。
+
+    **只在手动触发时调用** —— 该上游接口响应含手机号等敏感信息，后台定时刷新
+    刻意不碰它（避免高频打敏感接口）。只解析昵称，其余字段当场丢弃。
+    """
+    ctx = get_ctx(request)
+    updated: list[dict] = []
+    failed: list[dict] = []
+    for entry in ctx.pool.all_entries():
+        if entry.kind == "apikey":
+            continue
+        try:
+            auth = await ctx.refresher.ensure_valid(ctx.pool.auth_for(entry))
+            nickname = await ctx.client.fetch_account_profile(auth)
+        except Exception as exc:  # noqa: BLE001 - 单个账号失败不影响其余
+            failed.append({"uid": entry.uid, "error": str(exc)[:120]})
+            continue
+        if nickname and nickname != entry.nickname:
+            ctx.pool.set_nickname(entry.uid, nickname)
+            updated.append({"uid": entry.uid, "nickname": nickname})
+    record_audit(ctx.db, client_ip(request), "sync_nicknames", "",
+                 "ok", f"updated={len(updated)} failed={len(failed)}")
+    return {"ok": True, "updated": updated, "failed": failed}
+
+
 @router.get("/selection/candidates")
 async def selection_candidates(
     request: Request, realm: str = "", model: str = "",

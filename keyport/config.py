@@ -135,6 +135,13 @@ class PoolConfig:
     # 留空（默认）= 关闭该特性，保持旧口径「模型唯一归属才限定域，否则不限域」。
     realm_priority: list[str] = field(default_factory=list)
 
+    # ---- 换号轮转退避 ----
+    # 换号零间隔本身就是可被统计的节奏特征；退避时长 = base·2^n 封顶 cap，
+    # 再施加 ±25% 抖动打散多请求相位（WAF 频控按密度判罚，齐步走的固定周期
+    # 退避会再次聚团）。base 置 0 = 关闭退避（测试用）。
+    rotate_backoff_base_seconds: float = 0.5
+    rotate_backoff_cap_seconds: float = 8.0
+
 
 @dataclass
 class SessionStickyConfig:

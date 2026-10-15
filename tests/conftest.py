@@ -30,6 +30,9 @@ def make_test_config(tmp_path: Path, **overrides) -> Config:
     )
     if "captcha" not in overrides:
         cfg.captcha.enabled = False
+    # 关闭换号轮转退避：生产默认 500ms 起指数退避（防封需要），但测试里
+    # 每次换号都真睡 0.5~8s 会让套件从 30s 涨到 60s+，而退避本身有独立单测覆盖。
+    cfg.pool.rotate_backoff_base_seconds = 0.0
     # 指向临时文件：热改落盘只写这里，绝不碰项目根的 config.json
     cfg.source_path = tmp_path / "config.json"
     return cfg

@@ -19,6 +19,7 @@ class ErrorKind(str, Enum):
     BAD_REQUEST = "bad_request"  # 400 请求本身不合法 → 不冷却，直接回客户端
     CAPTCHA = "captcha"        # 上游端点要求人机验证（3007）→ 非账号过错，不冷却不换号
     RISK = "risk"              # 风控 3012 / unusual activity → 指数退避，累计升级禁用
+    WAF = "waf"                # 403 且无业务信封（WAF 拦截页）→ 指向出口 IP 而非账号
     SERVER = "server"          # 5xx → 计入连败
     NETWORK = "network"        # 连接/超时 → 计入连败
     UNKNOWN = "unknown"
@@ -94,6 +95,24 @@ def is_risk_control(status: int, body: str = "") -> bool:
     return any(m.lower() in lowered for m in constants.RISK_CONTROL_MARKERS)
 
 
+def has_business_envelope(body: str) -> bool:
+    """错误 body 是否携带上游业务信封形态（含 `"code":` 或 `"msg":` 字段）。
+
+    只做**字段名命中**，不做 JSON 解析：畸形 JSON 但含 `"msg":` 字样仍按业务响应
+    保守处理 —— **宁漏判 WAF 也不误罚业务 403**（后者各有权威分类）。
+    """
+    return '"code":' in body or '"msg":' in body
+
+
+def is_waf_blocked(status: int, body: str = "") -> bool:
+    """403 是否为 WAF 拦截形态：**无业务信封**（HTML 拦截页 / 空体 / 纯文本）。
+
+    带业务信封的 403（`11140 request illegal` 等）仍走既有分类链，不受影响。
+    这个区分的意义是：WAF 拦的是**网关出口 IP** 而不是账号，处置方向完全不同。
+    """
+    return status == 403 and not has_business_envelope(body or "")
+
+
 def classify_status(status: int, body: str = "") -> ErrorKind:
     """按 HTTP 状态 + 响应体业务码分类错误。"""
     text = body or ""
@@ -117,6 +136,10 @@ def classify_status(status: int, body: str = "") -> ErrorKind:
         # 402/额度耗尽的变体也可能伪装成 403，业务码兜底
         if any(code in text for code in _BIZ_QUOTA_CODES):
             return ErrorKind.PAYMENT
+        # WAF 拦截页（无业务信封）指向出口 IP，不是账号鉴权失效 ——
+        # 判成 AUTH 会把健康账号一个个禁用掉
+        if status == 403 and is_waf_blocked(status, text):
+            return ErrorKind.WAF
         return ErrorKind.AUTH
     if status == 400:
         return ErrorKind.BAD_REQUEST

@@ -254,6 +254,19 @@ class AccountPool:
             ],
         }
 
+    def set_nickname(self, uid: str, nickname: str) -> bool:
+        """更新账号昵称（改名后免重登同步）；返回账号是否存在。"""
+        with self._lock:
+            entry = self._entries.get(uid)
+            if entry is None:
+                return False
+            entry.nickname = nickname or ""
+            self.db.execute(
+                "UPDATE accounts SET nickname=?, updated_at=? WHERE uid=?",
+                (entry.nickname, db_now(), uid),
+            )
+            return True
+
     # ---- 选号 + 租约 ----
 
     def pick(

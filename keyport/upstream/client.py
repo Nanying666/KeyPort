@@ -16,6 +16,7 @@ from ..config import Config
 from . import constants as C
 from . import headers as H
 from .base import AccountAuth, ChatMeta, ErrorKind, UpstreamError, classify_status
+from .context_catalog import context_window, max_output_tokens
 from .fingerprint import profile_for
 from .zcode_system import attach_context_prefix, build_zcode_plan_system
 
@@ -607,6 +608,39 @@ class UpstreamClient:
 
     # ---- 自动化任务 ----
 
+    async def fetch_account_profile(self, auth: AccountAuth) -> str:
+        """拉取账号最新昵称（改名后免重登同步）；失败抛 `UpstreamError`。
+
+        **隐私边界（重要）**：该接口响应包含手机号（`phoneNumber`）等个人敏感信息。
+        本方法**只解析 `nickname` 与 `uid`**（`uid` 仅做一致性核对），其余字段一概
+        不解析、不落日志、不透传 —— 调用方也拿不到。
+
+        `uid` 与凭证不一致时报错（**防串号**）：那说明拿到了别人的资料。
+        """
+        client = await self.client_for(auth)
+        base = _billing_base(self.cfg, auth)
+        hdrs = H.web_headers(self.cfg.upstream, auth, base)
+        try:
+            resp = await client.get(base + "/console/account", headers=hdrs)
+        except httpx.HTTPError as exc:
+            raise UpstreamError(ErrorKind.NETWORK, 0, str(exc)) from exc
+        if resp.status_code >= 400:
+            raise _error_from(resp.status_code, resp.text, dict(resp.headers))
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise UpstreamError(ErrorKind.UNKNOWN, resp.status_code,
+                                "profile 非 JSON") from exc
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            payload = data if isinstance(data, dict) else {}
+        nickname = payload.get("nickname")
+        uid = payload.get("uid")
+        if isinstance(uid, str) and uid and auth.uid and uid != auth.uid:
+            raise UpstreamError(ErrorKind.UNKNOWN, resp.status_code,
+                                f"profile uid mismatch: resp={uid} auth={auth.uid}")
+        return str(nickname).strip() if isinstance(nickname, str) else ""
+
     async def daily_checkin(self, auth: AccountAuth) -> dict[str, Any]:
         """每日签到（幂等，重复调用不重复计）。"""
         return await self._billing_post(auth, [PATH_CHECKIN, PATH_CHECKIN_ALT], {})
@@ -798,12 +832,17 @@ def _normalize_models(data: Any) -> list[dict[str, Any]]:
             entry["credit_factor"] = factor
         ctx = (item.get("contextWindow") or item.get("context_window")
                or item.get("context_length"))
-        if isinstance(ctx, (int, float)) and ctx > 0:
-            entry["context_window"] = int(ctx)
+        remote_ctx = int(ctx) if isinstance(ctx, (int, float)) and ctx > 0 else None
+        # 上游零值/缺失时按静态知识表补齐（宁可高估不低估：低估会让客户端
+        # 按 context_length 提前截断、白白丢上下文）
+        entry["context_window"] = context_window(entry["id"], remote_ctx)
         max_out = (item.get("maxTokens") or item.get("max_output_tokens")
                    or item.get("maxOutputTokens"))
-        if isinstance(max_out, (int, float)) and max_out > 0:
-            entry["max_output_tokens"] = int(max_out)
+        remote_out = int(max_out) if isinstance(max_out, (int, float)) and max_out > 0 else None
+        # 输出上限未知 → 省略字段（无「宁可高估」的安全侧，不编造）
+        resolved_out = max_output_tokens(entry["id"], remote_out)
+        if resolved_out is not None:
+            entry["max_output_tokens"] = resolved_out
         efforts = item.get("supportedEfforts") or item.get("reasoning_efforts")
         if isinstance(efforts, list) and efforts:
             entry["reasoning_efforts"] = [str(e) for e in efforts]

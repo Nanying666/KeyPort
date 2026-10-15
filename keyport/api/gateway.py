@@ -269,8 +269,25 @@ class ChatSession:
                 self._note_error(exc)
                 if not exc.should_failover:
                     break
+                # WAF 403 拦的是**出口 IP** 而不是账号：短窗内多个不同账号接连命中
+                # 即判定 IP 级拦截，立即终止轮转 —— 否则会把一次客户端请求放大
+                # 成 N 次上游请求，同一出口继续打只会加重风控。
+                if exc.kind == ErrorKind.WAF and gw.waf_gate.note_waf(entry.uid):
+                    self.error = f"{exc.kind.value}: ip-level block, rotation stopped"
+                    break
                 self.retries += 1
                 realm_spent += 1
+                # 换号退避：零间隔本身就是可被统计的节奏特征；抖动打散多请求相位
+                # （WAF 频控按密度判罚，齐步走的固定周期退避会再次聚团）。
+                from ..upstream.rotateguard import backoff_after, sleep_ctx
+
+                wait = backoff_after(
+                    self.retries - 1,
+                    base=cfg.pool.rotate_backoff_base_seconds,
+                    cap=cfg.pool.rotate_backoff_cap_seconds,
+                )
+                if not await sleep_ctx(wait, gw.stop_event):
+                    break
 
         if last_err is not None:
             raise last_err
@@ -631,6 +648,13 @@ class Gateway:
         self.request_logger = request_logger
         # 模型注册表：用于无域前缀请求按模型归属自动路由（可为 None，测试常见）
         self.models = models
+        # WAF IP 级拦截状态机：进程内、重启清零（窗口 60s，重建成本极低）。
+        # 出口 IP 被上游 WAF 频控时，继续换号只会把一次请求放大 N 倍。
+        from ..upstream.rotateguard import WafIpGate
+
+        self.waf_gate = WafIpGate()
+        # 进程停机信号：换号退避等待可被取消（优雅停机不必等退避睡醒）
+        self.stop_event: asyncio.Event | None = None
 
     def realm_chain(self, model_id: str, explicit: str = "") -> list[str]:
         """选号域链（优先 → 兜底）；元素为空串表示「不限域」。

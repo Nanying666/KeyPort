@@ -98,6 +98,14 @@ def apply_error(
         entry.disabled_reason = "auth_failed"
         return "disabled:auth_failed"
 
+    if kind == ErrorKind.WAF:
+        # WAF 拦的是**出口 IP** 而不是账号：账号本身健康，禁用它会误杀整池。
+        # 只做有界软冷却，真正止损由请求层的 IP 级 fail-fast 负责。
+        wait = _exp_backoff(cfg.soft_rate_seconds, entry.consecutive_failures,
+                            cfg.soft_rate_max_seconds)
+        entry.cooldown_until = max(entry.cooldown_until, now + wait)
+        return f"waf_cooldown:{wait}s"
+
     if kind == ErrorKind.RISK:
         banned = entry.risk_penalty(
             cfg.risk_cooldown_seconds, cfg.risk_cooldown_max_seconds,

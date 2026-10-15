@@ -210,6 +210,35 @@ def billing_headers(cfg: UpstreamConfig, auth: AccountAuth) -> dict[str, str]:
     return headers
 
 
+def web_headers(cfg: UpstreamConfig, auth: AccountAuth, base: str) -> dict[str, str]:
+    """Web 控制台端点头（`/console/*`、成长任务领奖等）。
+
+    与 billing 头的关键差异是 `x-client-platform: web` —— 上游按它判定调用来源，
+    成长任务的领奖与资料读取都要求这一形态（实测无需 Web 会话 cookie）。
+    """
+    origin = base.rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {auth.access_token}",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "x-client-platform": "web",
+        "Origin": origin,
+        "Referer": origin + "/profile/account-settings",
+        "Accept-Language": accept_language(auth),
+    }
+    ua = billing_user_agent(cfg)
+    if ua:
+        headers["User-Agent"] = ua
+    if auth.uid:
+        headers["X-User-Id"] = auth.uid
+    if auth.enterprise_id:
+        headers["X-Enterprise-Id"] = auth.enterprise_id
+        headers["X-Tenant-Id"] = auth.enterprise_id
+    if auth.domain:
+        headers["X-Domain"] = auth.domain
+    return headers
+
+
 def refresh_headers(cfg: UpstreamConfig, auth: AccountAuth) -> dict[str, str]:
     """refresh 端点专属头（X-Refresh-Token 只出现在这里）。"""
     headers = common_headers(cfg, auth)
