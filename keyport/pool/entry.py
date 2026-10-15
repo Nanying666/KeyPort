@@ -15,6 +15,50 @@ from dataclasses import dataclass, field
 
 from ..config import PoolConfig
 
+# ---- 运行态枚举（值稳定，前端按字符串匹配）----
+
+RUN_ONLINE = "online"                    # 正常可用
+RUN_COOLING = "cooling"                  # 一般冷却（自动恢复）
+RUN_RATE_LIMITED = "rate_limited"        # 限流冷却（账号级：429 / WAF）—— 等一会儿就好
+RUN_RISK_COOLING = "risk_cooling"        # 风控冷却（11140 / 11128 / WAF）—— 等下去不会好
+RUN_EXHAUSTED = "exhausted"              # 额度/积分耗尽（等到次日或充值）
+RUN_RELOGIN = "relogin"                  # 需重新登录 / 会话失效（必须人工）
+RUN_EGRESS_ERROR = "egress_error"        # 出口配置不可用（不修会从本机 IP 裸奔）
+RUN_DISABLED = "disabled"                # 系统判定不可用
+RUN_MANUAL_DISABLED = "manual_disabled"  # 运维手动停用
+
+RUN_STATES = (
+    RUN_ONLINE, RUN_COOLING, RUN_RATE_LIMITED, RUN_RISK_COOLING,
+    RUN_EXHAUSTED, RUN_RELOGIN, RUN_EGRESS_ERROR, RUN_DISABLED,
+    RUN_MANUAL_DISABLED,
+)
+
+
+def _is_relogin_reason(reason: str) -> bool:
+    """会话失效 / 试用未激活 —— 都要人工动作，等不来。"""
+    return any(k in reason for k in
+               ("14017", "12153", "重登", "重新登录", "session", "trial",
+                "auth_failed", "no credential"))
+
+
+def _is_exhausted_reason(reason: str) -> bool:
+    """额度/积分耗尽 —— 要么等到次日 04:00，要么充值，不是故障。"""
+    return any(k in reason for k in
+               ("quota", "余额", "积分不足", "额度耗尽", "402", "exhaust"))
+
+
+def _is_risk_reason(reason: str) -> bool:
+    """风控类 —— **关键区分点**：这类冷却等下去不会好，必须先看出口与请求形态。"""
+    return any(k in reason for k in
+               ("11140", "11128", "风控", "risk", "request illegal", "waf",
+                "指纹", "非法"))
+
+
+def _is_rate_limit_reason(reason: str) -> bool:
+    """限流类 —— 可自动恢复，但应看退避决定要不要换个出口。"""
+    return any(k in reason for k in
+               ("429", "6004", "rate limit", "限流", "soft"))
+
 
 @dataclass
 class AccountEntry:
@@ -125,6 +169,62 @@ class AccountEntry:
         if self.manual_disabled:
             return "manual_disabled"
         return ""
+
+    def run_state(self, now: int) -> str:
+        """账号运行态（九态枚举，供面板与告警使用）。
+
+        把散在布尔位与自由文案里的处境收敛成一个**显式枚举**。此前「为什么不在池里」
+        只能靠三个布尔位加一段自由文案自己拼，运维看到的典型困惑是：
+
+        - 「冷却中」既可能是限流（一分钟后自己好），也可能是风控（说明出口或请求
+          形态有问题，**等下去不会好**）—— 两者**处置方向相反**，却显示成同一个东西；
+        - 「额度耗尽」与「需要重新登录」都被压成 disabled/cooling，无法一眼分辨
+          「等一等 / 充点钱」与「必须人工重登」。
+
+        判定顺序**先「不可自动恢复」，后「可自动恢复」**：
+
+            manual_disabled > disabled > egress_error > relogin > exhausted
+            > risk_cooling > rate_limited > cooling > online
+
+        两个顺序上的刻意选择：
+
+        - `manual_disabled` 排第一：那是**人的决定**，任何系统状态都不该把它盖住 ——
+          否则运维会看到「冷却中」而去等它自动恢复，实际它永远不会回来。
+        - `egress_error` 排在冷却类之前：出口配置坏掉的账号**看起来完全健康**
+          （凭证有效、积分充足），但它一被选中就会从本机 IP 出去 —— 这是最该被
+          立刻看见的一类。
+        """
+        if self.manual_disabled:
+            return RUN_MANUAL_DISABLED
+        if not self.enabled:
+            # 系统禁用位之下再细分「等得来」与「等不来」
+            reason = (self.disabled_reason or "").lower()
+            if _is_relogin_reason(reason):
+                return RUN_RELOGIN
+            if _is_exhausted_reason(reason):
+                return RUN_EXHAUSTED
+            if _is_risk_reason(reason):
+                return RUN_RISK_COOLING
+            return RUN_DISABLED
+        if self.egress_error:
+            return RUN_EGRESS_ERROR
+
+        reason = (self.last_error or "").lower()
+        if self.cooldown_until > now:
+            if _is_risk_reason(reason):
+                return RUN_RISK_COOLING
+            if _is_rate_limit_reason(reason):
+                return RUN_RATE_LIMITED
+            if _is_relogin_reason(reason):
+                return RUN_RELOGIN
+            if _is_exhausted_reason(reason):
+                return RUN_EXHAUSTED
+            return RUN_COOLING
+        if self.breaker_until > now or self.degraded_until > now:
+            return RUN_COOLING
+        # 模型级冷却**不算账号级不可用**：run_state 回答的是"这个号整体能不能用"，
+        # 而"某个模型被限"是独立维度（由模型冷却明细表达）。
+        return RUN_ONLINE
 
     # ---- 风控退避 ----
 

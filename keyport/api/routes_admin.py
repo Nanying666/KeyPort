@@ -128,6 +128,7 @@ def _account_view(ctx, entry) -> dict[str, Any]:
         "in_pool": entry.in_pool(),
         "healthy": entry.healthy(now),
         "status": entry.cooldown_reason(now) or "ok",
+        "run_state": entry.run_state(now),
         "cooldown_remaining": entry.cooldown_remaining(now),
         "disabled_reason": entry.disabled_reason,
         "credits": entry.credits,

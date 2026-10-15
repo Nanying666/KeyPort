@@ -82,6 +82,8 @@ def build_context(cfg: Config | None = None) -> AppContext:
     gateway = Gateway(cfg, pool, client, refresher, key_store, request_logger,
                       models=models)
     scheduler = Scheduler(cfg, db, pool, client, refresher)
+    # 告警数据源需要读 WAF IP 级拦截状态（该状态在网关上）
+    scheduler.gateway = gateway
     claims = ClaimService(cfg.claim, client, db, captcha=captcha)
     ctx = AppContext(
         cfg=cfg, db=db, pool=pool, client=client, refresher=refresher,

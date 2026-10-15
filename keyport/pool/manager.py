@@ -762,6 +762,23 @@ class AccountPool:
             self.db.execute("DELETE FROM accounts WHERE uid=?", (uid,))
             return True
 
+    def alert_health(self, realm: str) -> Any:
+        """告警用的单域健康快照（只读，不触碰任何账号状态）。"""
+        from ..alert import Health
+
+        now = int(time.time())
+        with self._lock:
+            entries = [e for e in self._entries.values() if e.realm == realm]
+        return Health(
+            total=len(entries),
+            healthy=sum(1 for e in entries if e.healthy(now)),
+            cooling=sum(1 for e in entries if e.cooldown_until > now),
+            disabled=sum(1 for e in entries if not e.enabled),
+            breaker=sum(1 for e in entries if e.breaker_until > now),
+            degraded=sum(1 for e in entries if e.degraded_until > now),
+            in_flight=sum(e.inflight for e in entries),
+        )
+
     def summary(self) -> dict:
         """池概览（供 /healthz 与看板）。"""
         now = int(time.time())
@@ -769,12 +786,18 @@ class AccountPool:
             entries = list(self._entries.values())
         healthy = [e for e in entries if e.healthy(now)]
         by_realm: dict[str, int] = {}
+        by_state: dict[str, int] = {}
         for e in entries:
             by_realm[e.realm] = by_realm.get(e.realm, 0) + 1
+            state = e.run_state(now)
+            by_state[state] = by_state.get(state, 0) + 1
         return {
             "total": len(entries),
             "healthy": len(healthy),
             "inflight": sum(e.inflight for e in entries),
             "sticky_bindings": self.sticky.size(),
             "by_realm": by_realm,
+            # 运行态分布：区分「等一会儿就好」（rate_limited）与「等下去不会好」
+            # （risk_cooling / relogin）—— 两者处置方向相反
+            "by_state": by_state,
         }

@@ -184,6 +184,30 @@ class InstallConfig:
 
 
 @dataclass
+class AlertConfigSection:
+    """可用性告警（默认关闭：不启用时不起循环、不发任何 HTTP）。"""
+
+    enabled: bool = False
+    webhook_url: str = ""
+    # 非空时对 body 做 HMAC-SHA256 签名（X-KP-Signature）
+    secret: str = ""
+    interval_seconds: float = 30.0
+    timeout_seconds: float = 5.0
+    startup_grace_seconds: float = 30.0
+    # 各域最低可接受健康账号数：低于才告警；0 = 关闭该规则
+    # （纯 cn 部署默认关 global，否则常驻误报）
+    min_healthy_cn: int = 0
+    min_healthy_global: int = 0
+    recover_healthy: int = 1
+    # 熔断中账号数阈值；0 = 关闭
+    breaker_threshold: int = 0
+    for_ticks: int = 2
+    clear_ticks: int = 2
+    send_resolve: bool = False
+    service_name: str = "keyport"
+
+
+@dataclass
 class ScheduleConfig:
     """定时任务排程（小时为本地时区整点）。"""
 
@@ -379,6 +403,7 @@ class Config:
     guards: GuardConfig = field(default_factory=GuardConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    alert: AlertConfigSection = field(default_factory=AlertConfigSection)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)

@@ -66,6 +66,7 @@ class Scheduler:
         self.refresher = refresher
         self._task: asyncio.Task | None = None
         self._balance_task: asyncio.Task | None = None
+        self._alert_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_run: dict[tuple[str, str], int] = {}  # (task,realm) -> hour stamp
         self.last_results: list[dict] = []
@@ -78,10 +79,12 @@ class Scheduler:
             self._task = asyncio.create_task(self._loop())
         if self._balance_task is None or self._balance_task.done():
             self._balance_task = asyncio.create_task(self._balance_loop())
+        if self._alert_task is None or self._alert_task.done():
+            self._alert_task = asyncio.create_task(self._alert_loop())
 
     async def stop(self) -> None:
         self._stop.set()
-        for attr in ("_task", "_balance_task"):
+        for attr in ("_task", "_balance_task", "_alert_task"):
             task = getattr(self, attr)
             if task is not None:
                 task.cancel()
@@ -90,6 +93,51 @@ class Scheduler:
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
                 setattr(self, attr, None)
+
+    # ---- 可用性告警 ----
+
+    async def _alert_loop(self) -> None:
+        """周期评估池健康度并在越界时投递 webhook（默认关闭）。"""
+        from .alert import Monitor
+
+        monitor = Monitor(self.cfg.alert)
+        if not monitor.enabled:
+            return
+        while not self._stop.is_set():
+            interval = max(5.0, float(self.cfg.alert.interval_seconds or 30))
+            try:
+                for record in monitor.tick(self):
+                    await self._deliver(record)
+            except Exception as exc:  # noqa: BLE001 - 后台循环不允许被单次失败打断
+                log.warning("告警评估失败：%s", exc)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+
+    async def _deliver(self, record: dict) -> None:
+        """投递一条告警；失败只记日志、不重试（通知是旁路）。"""
+        import httpx
+
+        timeout = float(self.cfg.alert.timeout_seconds or 5)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(record["url"], content=record["body"],
+                                         headers=record["headers"])
+            if resp.status_code >= 300:
+                log.warning("告警投递返回 HTTP %s", resp.status_code)
+        except Exception as exc:  # noqa: BLE001 - 投递失败不影响主流程
+            log.warning("告警投递失败：%s", exc)
+
+    # ---- 告警数据源（Source 协议实现）----
+
+    def health(self, realm: str) -> Any:
+        return self.pool.alert_health(realm)
+
+    def waf_active(self) -> bool:
+        gw = getattr(self, "gateway", None)
+        gate = getattr(gw, "waf_gate", None)
+        return bool(gate and gate.active())
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
