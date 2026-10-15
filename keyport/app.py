@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -46,6 +47,42 @@ from .upstream.claim import ClaimService
 from .upstream.client import UpstreamClient
 
 log = logging.getLogger("keyport")
+
+
+def _task_ledger(ctx: AppContext) -> dict[str, dict]:
+    """从既有 `task_runs` 台账聚合「每类任务最近一轮」的计数（供 /metrics）。
+
+    只为**跑过至少一轮**的任务返回条目 —— 从未跑过的任务没有序列，而不是
+    「时刻为 0」；否则服务刚启动时按 `time() - last_run > 86400` 的告警会在每次
+    部署时误报一轮。
+    """
+    ledger: dict[str, dict] = {}
+    for task in ("checkin", "travel", "activity", "keepalive", "cat"):
+        row = ctx.db.query_one(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN ok=1 THEN 1 ELSE 0 END) AS ok_n, "
+            "SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) AS fail_n, "
+            "SUM(CASE WHEN detail LIKE 'skipped:%' THEN 1 ELSE 0 END) AS skipped_n, "
+            "MAX(ts) AS finished "
+            "FROM task_runs WHERE task=? AND ts = ("
+            "  SELECT MAX(ts) FROM task_runs WHERE task=?)",
+            (task, task),
+        )
+        if row is None or not row["total"]:
+            continue
+        total = int(row["total"] or 0)
+        skipped_n = int(row["skipped_n"] or 0)
+        # 跳过记的是 ok=1（它是**预期**的正常态），所以要从 ok 里扣掉，
+        # 否则「全灭」判据会被跳过项污染
+        ok_n = max(0, int(row["ok_n"] or 0) - skipped_n)
+        fail_n = int(row["fail_n"] or 0)
+        ledger[task] = {
+            "total": total, "ok": ok_n, "fail": fail_n,
+            "skipped": skipped_n, "finished": int(row["finished"] or 0),
+            # 「全灭」判据刻意不是失败率：还有账号成功就说明上游是通的
+            "all_failed": bool(fail_n > 0 and ok_n == 0),
+        }
+    return ledger
 
 
 def build_context(cfg: Config | None = None) -> AppContext:
@@ -189,6 +226,53 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "model_costs": ctx.pool.ledger.snapshot(),
             "cost_explore": ctx.pool.ledger.explore_snapshot(),
         }
+
+    @app.get("/metrics")
+    async def metrics():
+        """Prometheus 文本格式指标（零依赖现算，不触发任何上游调用）。
+
+        刻意**不加管理台鉴权**：标准抓取端配置的是 bearer token 或网络层隔离，
+        而这里的数据全部是池级聚合量（不含 uid、凭证、会话键）。
+        """
+        from .metrics import render_metrics
+
+        now = int(time.time())
+        health = {label: ctx.pool.metrics_health(realm)
+                  for label, realm in (("cn", "cn"), ("global", "global"),
+                                       ("all", ""))}
+        # 请求统计：近 24h 的按模型聚合（现算，不维护第二份累加器）
+        rows = ctx.db.query(
+            "SELECT model, "
+            "SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) AS success, "
+            "SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS failed, "
+            "COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
+            "COALESCE(SUM(completion_tokens),0) AS completion_tokens, "
+            "COALESCE(SUM(credits),0) AS credits, "
+            "COALESCE(AVG(NULLIF(ttfb_ms,0)),0) AS avg_ttfb_ms "
+            "FROM request_logs WHERE ts >= ? AND model <> '' GROUP BY model",
+            (now - 86400,),
+        )
+        totals = ctx.db.query_one(
+            "SELECT SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) AS success, "
+            "SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS failed "
+            "FROM request_logs WHERE ts >= ?",
+            (now - 86400,),
+        ) or {}
+        tasks = _task_ledger(ctx)
+        gate = getattr(ctx.gateway, "waf_gate", None)
+        return Response(
+            content=render_metrics(
+                health=health,
+                totals={"success": int(totals["success"] or 0),
+                        "failed": int(totals["failed"] or 0)},
+                models=[dict(r) for r in rows],
+                sticky_sessions=ctx.pool.sticky.size(),
+                waf_active=bool(gate and gate.active()),
+                tasks=tasks,
+                since=int(getattr(ctx, "started_at", 0) or 0),
+            ),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     # ---- 静态托管（前端静态导出） ----
     static_dir = ctx.cfg.resolved_static_dir()

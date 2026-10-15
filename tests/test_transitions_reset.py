@@ -57,15 +57,37 @@ def test_model_limit_uses_upstream_reset_wall_clock():
 
 
 def test_model_limit_capped_by_local_max():
-    """上游明示很长的窗口仍受本地封顶约束（防一条脏数据摘除账号几万年）。"""
+    """上游明示很长的窗口仍受本地封顶约束（防一条脏数据摘除账号几万年）。
+
+    注意封顶用的是**模型级**上限（比账号级宽）：模型级只挡一个模型、账号仍健康，
+    所以可以放长到上游明示时刻；用账号级封顶会截断它，导致在真实窗口里反复撞墙。
+    """
     cfg = _cfg()
     entry = _entry()
-    far = NOW + 10 * 24 * 3600  # 10 天
+    far = NOW + 100 * 24 * 3600  # 100 天，远超模型级封顶
     body = json.dumps({"data": {"resets_at": far}})
     err = UpstreamError(ErrorKind.MODEL_LIMIT, 429, "hy3", body)
 
     apply_error(entry, err, cfg, NOW)
-    assert entry.model_cooldowns["hy3"] == NOW + cfg.soft_rate_max_seconds
+    assert entry.model_cooldowns["hy3"] == NOW + cfg.model_rate_max_seconds
+
+
+def test_model_limit_not_truncated_by_account_cap():
+    """回归：模型级冷却**不得**被账号级封顶截断。
+
+    被截断的后果不是账目错误，而是在真实窗口里反复撞墙：2h 一到该号对这个模型
+    重新进入候选 → 打一次必然失败的请求 → 再被 6004 打回、再等 2h……
+    """
+    cfg = _cfg()
+    entry = _entry()
+    reset = NOW + 5 * 3600          # 上游说 5 小时后恢复
+    assert reset > NOW + cfg.soft_rate_max_seconds   # 超过账号级封顶
+    body = json.dumps({"data": {"resets_at": reset}})
+    apply_error(entry, UpstreamError(ErrorKind.MODEL_LIMIT, 429, "hy3", body), cfg, NOW)
+
+    assert entry.model_cooldowns["hy3"] == reset
+    # 权威时刻单独留痕，供自愈判据使用
+    assert entry.model_reset_at["hy3"] == reset
 
 
 def test_model_limit_falls_back_to_local_when_no_time_info():

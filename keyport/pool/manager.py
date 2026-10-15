@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from typing import Any
@@ -27,6 +28,7 @@ from .guards import (
     guard_block_reason,
     limits_for,
 )
+from .heal import heal_entry
 from .ledger import ModelLedger
 from .selector import available_uids, preview_candidates, select
 from .sticky import StickyStore
@@ -39,6 +41,8 @@ from .transitions import (
     record_rate_limited,
     revive,
 )
+
+log = logging.getLogger("keyport.pool")
 
 
 def _load_fingerprint(raw: object) -> dict:
@@ -120,14 +124,23 @@ class AccountPool:
             return
         now = int(time.time())
         accounts = data.get("accounts") or {}
+        healed = False
         with self._lock:
             for uid, state in accounts.items():
                 entry = self._entries.get(uid)
                 if entry is not None and isinstance(state, dict):
                     entry.load_state(state, now)
+                    # 存量自愈：代码修了但磁盘状态还是旧形态 —— 升级程序不会让
+                    # 被错误挡住的健康号回来。两条自愈都在这里跑（唯一的恢复入口）。
+                    for note in heal_entry(entry, now, self.cfg.pool.model_rate_max_seconds):
+                        log.warning("[pool] %s", note)
+                        healed = True
             ledger_rows = data.get("model_ledger")
             if isinstance(ledger_rows, list):
                 self.ledger.load(ledger_rows)
+        # 动过就立刻物化回磁盘：否则修正只活在内存里，重启一次又要重算重打日志
+        if healed:
+            self.save_state()
 
     def save_state(self) -> None:
         """把运行时状态落盘（冷却/熔断/额度/账本）。"""
@@ -766,18 +779,38 @@ class AccountPool:
         """告警用的单域健康快照（只读，不触碰任何账号状态）。"""
         from ..alert import Health
 
+        h = self.metrics_health(realm)
+        return Health(
+            total=h["total"], healthy=h["healthy"], cooling=h["cooling"],
+            disabled=h["disabled"], breaker=h["breaker"], degraded=h["degraded"],
+            in_flight=h["in_flight"],
+        )
+
+    def metrics_health(self, realm: str = "") -> dict:
+        """指标用的健康快照（只读现算）。
+
+        状态维度是**原因分解而非互斥分类**：熔断/降权号同时计入 cooling；
+        manual_disabled 是 disabled 的子集；model_cooled 与账号级健康正交
+        （该号对触发模型不可用、对其他模型仍可选）。
+        """
         now = int(time.time())
         with self._lock:
-            entries = [e for e in self._entries.values() if e.realm == realm]
-        return Health(
-            total=len(entries),
-            healthy=sum(1 for e in entries if e.healthy(now)),
-            cooling=sum(1 for e in entries if e.cooldown_until > now),
-            disabled=sum(1 for e in entries if not e.enabled),
-            breaker=sum(1 for e in entries if e.breaker_until > now),
-            degraded=sum(1 for e in entries if e.degraded_until > now),
-            in_flight=sum(e.inflight for e in entries),
-        )
+            entries = [e for e in self._entries.values()
+                       if not realm or e.realm == realm]
+        return {
+            "total": len(entries),
+            "healthy": sum(1 for e in entries if e.healthy(now)),
+            "cooling": sum(1 for e in entries if e.cooldown_until > now),
+            "disabled": sum(1 for e in entries if not e.enabled),
+            "in_flight_full": sum(1 for e in entries
+                                  if not e.has_capacity(self.cfg.pool)),
+            "breaker": sum(1 for e in entries if e.breaker_until > now),
+            "degraded": sum(1 for e in entries if e.degraded_until > now),
+            "manual_disabled": sum(1 for e in entries if e.manual_disabled),
+            "model_cooled": sum(1 for e in entries
+                                if any(v > now for v in e.model_cooldowns.values())),
+            "in_flight": sum(e.inflight for e in entries),
+        }
 
     def summary(self) -> dict:
         """池概览（供 /healthz 与看板）。"""

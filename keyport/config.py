@@ -100,6 +100,10 @@ class PoolConfig:
     cost_explore_interval_seconds: int = 1800
     soft_rate_seconds: int = 600        # 429 软冷却起始
     soft_rate_max_seconds: int = 7200   # 429 软冷却封顶
+    # 模型级冷却封顶。刻意比账号级宽：模型级只挡一个模型，账号仍健康，
+    # 所以可以放长到上游明示的重置时刻（账号级封顶会把它截断，导致在真实窗口里
+    # 反复撞墙 —— 2h 一到又打一次必然失败的请求）。
+    model_rate_max_seconds: int = 86400
     not_found_seconds: int = 60         # 404 固定短冷却
     top_k: int = 5                      # 短名单长度
     pick_gap_ms: int = 100              # 防惊群窗口

@@ -94,6 +94,9 @@ class AccountEntry:
     breaker_until: int = 0
     degraded_until: int = 0
     model_cooldowns: dict[str, int] = field(default_factory=dict)
+    # 模型级冷却的**权威重置时刻**（上游明示）。与 `model_cooldowns`（实际截止，
+    # 受本地封顶约束）分开存：两者不等即说明截止被截断过，是自愈的判据来源。
+    model_reset_at: dict[str, int] = field(default_factory=dict)
 
     # 在途租约
     inflight: int = 0
@@ -276,6 +279,7 @@ class AccountEntry:
             "breaker_until": self.breaker_until,
             "degraded_until": self.degraded_until,
             "model_cooldowns": dict(self.model_cooldowns),
+            "model_reset_at": dict(self.model_reset_at),
             "consecutive_failures": self.consecutive_failures,
             "enabled": self.enabled,
             "manual_disabled": self.manual_disabled,
@@ -304,6 +308,11 @@ class AccountEntry:
         if isinstance(raw_mc, dict):
             self.model_cooldowns = {
                 str(k): int(v) for k, v in raw_mc.items() if int(v or 0) > now
+            }
+        raw_reset = state.get("model_reset_at") or {}
+        if isinstance(raw_reset, dict):
+            self.model_reset_at = {
+                str(k): int(v) for k, v in raw_reset.items() if int(v or 0) > 0
             }
         self.consecutive_failures = int(state.get("consecutive_failures", 0) or 0)
         self.enabled = bool(state.get("enabled", True))

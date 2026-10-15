@@ -61,13 +61,22 @@ def apply_error(
         # 只冷却触发调用的模型。冷却截止**优先对齐上游明示的重置墙钟** ——
         # 否则「6004 只冷却该模型、切模型即可用」这个承诺在真实流量里不成立：
         # 一条无 Retry-After、只把时间写在 body 里的 6004 会退化成账号级冷却。
+        #
+        # 封顶用**模型级**上限（比账号级宽）：模型级只挡一个模型、账号仍健康，
+        # 所以可以放长到上游明示时刻；用账号级封顶会截断它，导致在真实窗口里
+        # 反复撞墙（2h 一到又打一次必然失败的请求）。
         model = err.message or ""
-        until, source = _authoritative_until(err, now, cfg.soft_rate_max_seconds)
+        until, source = _authoritative_until(err, now, cfg.model_rate_max_seconds)
         if not until:
             until = now + cfg.soft_rate_seconds
             source = "local"
         if model:
             entry.model_cooldowns[model] = max(entry.model_cooldowns.get(model, 0), until)
+            # 权威时刻单独留痕：与截止不等即说明被截断过（自愈判据）
+            if source not in ("local", "none", "expired"):
+                entry.model_reset_at[model] = max(
+                    entry.model_reset_at.get(model, 0), int(err.reset_at(now).epoch or 0)
+                )
             return f"model_cooldown:{model}:{until - now}s:{source}"
         entry.cooldown_until = max(entry.cooldown_until, until)
         return f"cooldown:{until - now}s:{source}"
