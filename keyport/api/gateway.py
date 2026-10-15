@@ -253,7 +253,8 @@ class ChatSession:
             except UpstreamError as exc:
                 gw.pool.release(entry.uid)
                 last_err = exc
-                gw.pool.record_error(entry.uid, exc, self.params.conversation_id)
+                gw.pool.record_error(entry.uid, exc, self.params.conversation_id,
+                                   model=self.params.model)
                 self._note_error(exc)
                 if not exc.should_failover:
                     break
@@ -381,13 +382,15 @@ class ChatSession:
             return captcha_retries, retries_429, retries_5xx, use_fallback, "failover", holding
 
         def _failover() -> tuple[int, int, int, bool, str, bool]:
-            pool.record_error(entry.uid, exc, self.params.conversation_id)
+            pool.record_error(entry.uid, exc, self.params.conversation_id,
+                              model=self.params.model)
             return captcha_retries, retries_429, retries_5xx, use_fallback, "failover", holding
 
         # 风控 / 鉴权失效 / 额度耗尽：同账号有回退 Key 时先切回退通道
         if kind in (ErrorKind.RISK, ErrorKind.AUTH, ErrorKind.PAYMENT) and \
                 needs_captcha and not use_fallback and auth.has_fallback():
-            action = pool.record_error(entry.uid, exc, self.params.conversation_id)
+            action = pool.record_error(entry.uid, exc, self.params.conversation_id,
+                              model=self.params.model)
             if kind == ErrorKind.RISK:
                 self._maybe_rotate_on_risk(entry, action)
             return captcha_retries, 0, retries_5xx, True, "retry", holding
@@ -403,7 +406,8 @@ class ChatSession:
                 except Exception:  # noqa: BLE001 - 清池失败不该影响重试
                     pass
             if captcha_retries < MAX_CAPTCHA_RETRIES:
-                pool.record_error(entry.uid, exc, self.params.conversation_id)
+                pool.record_error(entry.uid, exc, self.params.conversation_id,
+                              model=self.params.model)
                 return captcha_retries, retries_429, retries_5xx, use_fallback, "retry", holding
 
         # 429 频控：不冷却账号，按 Retry-After 原地等待重试；耗尽后换号
@@ -452,7 +456,8 @@ class ChatSession:
             return captcha_retries, retries_429, retries_5xx, use_fallback, "failover", holding
 
         # 其余（含重试耗尽、风控无回退、额度耗尽）：按语义落状态并换号
-        action = pool.record_error(entry.uid, exc, self.params.conversation_id)
+        action = pool.record_error(entry.uid, exc, self.params.conversation_id,
+                              model=self.params.model)
         self._maybe_rotate_on_risk(entry, action)
         return captcha_retries, retries_429, retries_5xx, use_fallback, "failover", holding
 
@@ -561,6 +566,7 @@ class ChatSession:
                     self.uid,
                     UpstreamError(ErrorKind.NETWORK, 0, str(exc)),
                     self.params.conversation_id,
+                    model=self.params.model,
                 )
         except RuntimeError as exc:
             # 上游在流中途报错（如 Anthropic error 事件）

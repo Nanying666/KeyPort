@@ -50,8 +50,15 @@ def apply_error(
     err: UpstreamError,
     cfg: PoolConfig,
     now: int,
+    model: str = "",
 ) -> str:
-    """按错误类型更新账号状态；返回人类可读的处置说明。"""
+    """按错误类型更新账号状态；返回人类可读的处置说明。
+
+    `model` 是**本次请求实际使用的模型名**。模型级冷却（6004）必须用它做键 ——
+    早先用 `err.message`（上游的错误**文案**）当键，而 `healthy_for_model` 查的是
+    真实模型名，两边永远对不上，于是「只冷却该模型、切模型即可用」这个承诺
+    在实现层从未成立：冷却条目写了、但永远不被命中。
+    """
     entry.failed_calls += 1
     entry.consecutive_failures += 1
     entry.last_error = f"{err.kind.value}:{err.message or err.status}"
@@ -65,7 +72,16 @@ def apply_error(
         # 封顶用**模型级**上限（比账号级宽）：模型级只挡一个模型、账号仍健康，
         # 所以可以放长到上游明示时刻；用账号级封顶会截断它，导致在真实窗口里
         # 反复撞墙（2h 一到又打一次必然失败的请求）。
-        model = err.message or ""
+        #
+        # 模型名取不到时**回落到账号级冷却**：那说明调用方没传模型，
+        # 与其写一个永远命不中的键（等于不冷却），不如挡住整个账号。
+        #
+        # **不计入账号连败**（抵消开头的自增）：6004 是**模型级**限额，账号本身
+        # 健康 —— 与 CAPTCHA 同类。计进去会污染账号级判定：连败是熔断与降权的
+        # 输入（阈值只有 3 / 5），而 6004 在真实流量里是**每请求都撞**的高频事件，
+        # 累积几百次后，下一个 5xx 会立刻把健康号熔断。
+        entry.failed_calls = max(0, entry.failed_calls - 1)
+        entry.consecutive_failures = max(0, entry.consecutive_failures - 1)
         until, source = _authoritative_until(err, now, cfg.model_rate_max_seconds)
         if not until:
             until = now + cfg.soft_rate_seconds
@@ -74,9 +90,10 @@ def apply_error(
             entry.model_cooldowns[model] = max(entry.model_cooldowns.get(model, 0), until)
             # 权威时刻单独留痕：与截止不等即说明被截断过（自愈判据）
             if source not in ("local", "none", "expired"):
-                entry.model_reset_at[model] = max(
-                    entry.model_reset_at.get(model, 0), int(err.reset_at(now).epoch or 0)
-                )
+                reset = err.reset_at(now)
+                if reset.epoch:
+                    entry.model_reset_at[model] = max(
+                        entry.model_reset_at.get(model, 0), int(reset.epoch))
             return f"model_cooldown:{model}:{until - now}s:{source}"
         entry.cooldown_until = max(entry.cooldown_until, until)
         return f"cooldown:{until - now}s:{source}"

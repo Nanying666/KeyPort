@@ -457,13 +457,19 @@ class AccountPool:
                 entry.last_error = ""
             self._persist_counters(entry)
 
-    def record_error(self, uid: str, err: UpstreamError, conversation_id: str = "") -> str:
+    def record_error(self, uid: str, err: UpstreamError, conversation_id: str = "",
+                     model: str = "") -> str:
+        """记录一次账号级错误。
+
+        `model` 是本次请求实际使用的模型名 —— 模型级冷却（6004）用它做键。
+        不传则 6004 回落到账号级冷却（**不写一个永远命不中的键**）。
+        """
         now = int(time.time())
         with self._lock:
             entry = self._entries.get(uid)
             if entry is None:
                 return ""
-            action = apply_error(entry, err, self.cfg.pool, now)
+            action = apply_error(entry, err, self.cfg.pool, now, model=model)
             self._persist_counters(entry)
         if conversation_id and err.should_failover:
             self.sticky.unbind(conversation_id)  # 失败自动解绑

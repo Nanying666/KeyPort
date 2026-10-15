@@ -107,12 +107,39 @@ def test_captcha_repeated_never_trips_breaker():
 
 
 def test_model_limit_cools_only_that_model():
+    """模型名必须由调用方**显式传入**。
+
+    早先用 `err.message`（上游的错误**文案**）当键，而 `healthy_for_model` 查的是
+    真实模型名 —— 两边永远对不上，冷却条目写了但**永远不被命中**。
+    """
     cfg = PoolConfig()
     now = int(time.time())
     e = _entry("a")
-    apply_error(e, UpstreamError(ErrorKind.MODEL_LIMIT, message="glm-5"), cfg, now)
+    apply_error(e, UpstreamError(ErrorKind.MODEL_LIMIT, message="usage exceeded"),
+                cfg, now, model="glm-5")
     assert e.model_cooldowns["glm-5"] > now
     assert e.cooldown_until == 0
+    # 键必须是模型名，不是错误文案
+    assert "usage exceeded" not in e.model_cooldowns
+    assert e.healthy_for_model(now, "glm-5") is False
+    # 切模型立即可用（这正是 6004 的语义）
+    assert e.healthy_for_model(now, "hy3") is True
+
+
+def test_model_limit_without_model_falls_back_to_account_cooldown():
+    """取不到模型名时**回落到账号级冷却**。
+
+    与其写一个永远命不中的键（等于完全不冷却、错误无限重放），
+    不如挡住整个账号。
+    """
+    cfg = PoolConfig()
+    now = int(time.time())
+    e = _entry("a")
+    detail = apply_error(e, UpstreamError(ErrorKind.MODEL_LIMIT, message="usage exceeded"),
+                         cfg, now)
+    assert detail.startswith("cooldown:")
+    assert e.model_cooldowns == {}
+    assert e.cooldown_until > now
 
 
 def test_success_resets_consecutive_failures():

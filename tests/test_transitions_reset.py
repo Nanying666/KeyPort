@@ -48,7 +48,7 @@ def test_model_limit_uses_upstream_reset_wall_clock():
     body = json.dumps({"code": 6004, "msg": f"将在 {_dt.datetime.fromtimestamp(reset_epoch, UPSTREAM_TZ).strftime('%Y-%m-%d %H:%M:%S')} 重置"})
     err = UpstreamError(ErrorKind.MODEL_LIMIT, 429, "hy3", body)
 
-    detail = apply_error(entry, err, _cfg(), NOW)
+    detail = apply_error(entry, err, _cfg(), NOW, model="hy3")
 
     assert "body-text" in detail
     assert entry.model_cooldowns["hy3"] == reset_epoch
@@ -68,7 +68,7 @@ def test_model_limit_capped_by_local_max():
     body = json.dumps({"data": {"resets_at": far}})
     err = UpstreamError(ErrorKind.MODEL_LIMIT, 429, "hy3", body)
 
-    apply_error(entry, err, cfg, NOW)
+    apply_error(entry, err, cfg, NOW, model="hy3")
     assert entry.model_cooldowns["hy3"] == NOW + cfg.model_rate_max_seconds
 
 
@@ -83,7 +83,8 @@ def test_model_limit_not_truncated_by_account_cap():
     reset = NOW + 5 * 3600          # 上游说 5 小时后恢复
     assert reset > NOW + cfg.soft_rate_max_seconds   # 超过账号级封顶
     body = json.dumps({"data": {"resets_at": reset}})
-    apply_error(entry, UpstreamError(ErrorKind.MODEL_LIMIT, 429, "hy3", body), cfg, NOW)
+    apply_error(entry, UpstreamError(ErrorKind.MODEL_LIMIT, 429, "hy3", body), cfg, NOW,
+                model="hy3")
 
     assert entry.model_cooldowns["hy3"] == reset
     # 权威时刻单独留痕，供自愈判据使用
@@ -93,7 +94,7 @@ def test_model_limit_not_truncated_by_account_cap():
 def test_model_limit_falls_back_to_local_when_no_time_info():
     entry = _entry()
     err = UpstreamError(ErrorKind.MODEL_LIMIT, 429, "hy3", '{"code":6004}')
-    detail = apply_error(entry, err, _cfg(), NOW)
+    detail = apply_error(entry, err, _cfg(), NOW, model="hy3")
     assert "local" in detail
     assert entry.model_cooldowns["hy3"] == NOW + _cfg().soft_rate_seconds
 
