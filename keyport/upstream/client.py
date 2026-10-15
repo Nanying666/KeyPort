@@ -742,6 +742,24 @@ class UpstreamClient:
 
         return await growth.claim_compensation(self, auth)
 
+    async def daily_chat(self, auth: AccountAuth, *, model: str = "",
+                         prompt: str = "", turn_timeout: float = 120.0,
+                         desktop_leg: bool = True, log: Any = None) -> dict[str, Any]:
+        """国际版每日活跃打卡（跑完一次网页端云 agent 会话）。
+
+        实现见 `upstream/webchat.py`。本方法只做转发。
+        """
+        from . import webchat
+
+        return await webchat.daily_chat(
+            self, auth,
+            model=model or webchat.DEFAULT_MODEL,
+            prompt=prompt or webchat.DEFAULT_PROMPT,
+            turn_timeout=turn_timeout,
+            desktop_leg=desktop_leg,
+            log=log,
+        )
+
     async def keepalive(self, auth: AccountAuth) -> dict[str, Any]:
         """Token 保活：读一次额度即刷新活跃（国际版为专属 Token 集中保活）。"""
         data = await self.fetch_credits(auth)

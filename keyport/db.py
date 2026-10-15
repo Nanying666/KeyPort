@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_used_at       INTEGER NOT NULL DEFAULT 0,
     last_error         TEXT NOT NULL DEFAULT '',
     last_checkin_at    INTEGER NOT NULL DEFAULT 0,
+    last_daily_chat    TEXT NOT NULL DEFAULT '',
     created_at         INTEGER NOT NULL DEFAULT 0,
     updated_at         INTEGER NOT NULL DEFAULT 0
 );
@@ -168,6 +169,8 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("accounts", "egress_checked_at", "INTEGER NOT NULL DEFAULT 0"),
     ("accounts", "egress_ip", "TEXT NOT NULL DEFAULT ''"),
     ("accounts", "egress_error", "TEXT NOT NULL DEFAULT ''"),
+    # 国际版每日活跃打卡：最近一次**成功**完成的日期时间串（空 = 从未完成）
+    ("accounts", "last_daily_chat", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 

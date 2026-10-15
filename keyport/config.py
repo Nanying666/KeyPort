@@ -240,6 +240,26 @@ class ScheduleConfig:
     keepalive_enabled: bool = True
     cat_enabled: bool = True
 
+    # ---- 国际版每日活跃打卡（网页端云 agent 会话）----
+    #
+    # **默认关闭**：这条链会真的建一条云会话、驱动 agent 跑完一轮，属于「有副作用
+    # 的上游动作」。开启前建议先用一个国际版账号手动验证链路能跑通。
+    #
+    # 官方判据是**跑完的 agent 会话**：向桌面端点发 chat/completions 不算数，
+    # 只建会话不接沙箱同样不算数（会话会停在 CREATING、零输出）。
+    web_active_enabled: bool = False
+    web_active_hours: list[int] = field(default_factory=lambda: [11])
+    # 打卡使用的模型。**选一个免费模型是刻意的** —— 漏了显式钉模型这一步，会话会
+    # 跑账号默认模型（网页端默认 Auto、按付费模型计费），每天的活跃就都在扣积分。
+    web_active_model: str = "deepseek-v4.1-flash"
+    # 一轮提示词。短问候即可（实测十几秒跑完）。
+    web_active_prompt: str = "Hi"
+    # 一轮最多等多久（秒）
+    web_active_timeout_seconds: int = 120
+    # 是否额外发一次桌面端对话。**它不计入官方日活**（判据只认网页腿），
+    # 保留是为了兼容；想省一次上游请求可以关掉。
+    web_active_desktop_leg: bool = True
+
     # ---- 余额后台刷新（分钟级，独立于整点排程）----
     # 余额是分钟级观测量；不周期刷新的话，积分冷却（余额耗尽）的账号要等到下一个
     # 签到点（最坏约 11.5 小时）才可能解冻。<=0 时回落 5 分钟。

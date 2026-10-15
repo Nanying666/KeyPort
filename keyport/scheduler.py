@@ -26,13 +26,26 @@ from .upstream.client import UpstreamClient
 
 log = logging.getLogger("keyport.scheduler")
 
-TASKS = ("checkin", "travel", "activity", "keepalive", "cat")
+TASKS = ("checkin", "travel", "activity", "keepalive", "cat", "web_active")
 
 # 成长任务行为事件（上报即点亮）
 GROWTH_EVENTS = (
     "open_app", "send_message", "use_tool", "view_profile",
     "daily_active", "share_content", "complete_profile", "invite_friend",
 )
+
+
+def _daily_chat_done(entry: Any, now: float | None = None) -> bool:
+    """国际版每日活跃打卡今天是否已完成（按自然日去重）。
+
+    与参考实现同口径：只比对 `YYYY-MM-DD` 前缀 —— 上游的日活判据是自然日，
+    跨天即重新可打。
+    """
+    last = str(getattr(entry, "last_daily_chat", "") or "")
+    if not last:
+        return False
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    return last.startswith(today)
 
 
 def _jitter_offset(task: str, local: time.struct_time, span_seconds: int) -> int:
@@ -171,6 +184,8 @@ class Scheduler:
             "activity": (sched.activity_enabled, sched.activity_hours),
             "keepalive": (sched.keepalive_enabled, sched.keepalive_hours),
             "cat": (sched.cat_enabled, sched.cat_hours),
+            # 国际版每日活跃打卡：默认关闭（有副作用的上游动作，先手动验证再开）
+            "web_active": (sched.web_active_enabled, sched.web_active_hours),
         }
         for task, (enabled, hours) in mapping.items():
             if not enabled or hour not in hours:
@@ -309,6 +324,15 @@ class Scheduler:
             if getattr(entry, "is_enterprise", False):
                 return "企业版无个人成长体系（上游 403），跳过"
             return ""
+        if task == "web_active":
+            # 与其它任务相反：这一条**只对国际版**有意义（国内版没有这套网页 agent）。
+            if getattr(entry, "realm", "") != "global":
+                return "国内版无网页 agent 每日活跃，跳过"
+            if getattr(entry, "is_enterprise", False):
+                return "企业版无个人成长体系（上游 403），跳过"
+            if _daily_chat_done(entry):
+                return "今日打卡已完成，跳过"
+            return ""
         if getattr(entry, "realm", "") == "global":
             return "国际版无国内任务体系，跳过"
         if getattr(entry, "is_enterprise", False):
@@ -338,6 +362,8 @@ class Scheduler:
                 data = await self.client.keepalive(auth)
                 return {"uid": entry.uid, "realm": entry.realm, "ok": True,
                         "detail": f"credits={data.get('credits')}"}
+            if task == "web_active":
+                return await self._web_active(entry, auth)
             if task == "cat":
                 # 夜猫任务复用旅行端点（独立排程，互不影响）
                 data = await self.client.travel(auth)
@@ -429,6 +455,47 @@ class Scheduler:
             pass
 
         return (" + " + " ".join(notes)) if notes else ""
+
+    async def _web_active(self, entry, auth) -> dict:
+        """国际版每日活跃打卡：跑完一次网页端云 agent 会话。
+
+        ## 为什么必须「跑完」
+
+        官方日活的判据是**跑完的 agent 会话**：向桌面端点发一次
+        `chat/completions` 不算数，只建一条网页会话、不接沙箱同样不算数
+        （会话会停在 `CREATING`、零输出）。所以这里走的是完整四步：
+        建会话 → 取沙箱 → 驱动 ACP 回合 → 轮询到 `completed`。
+
+        ## 记账纪律
+
+        `mark_daily_chat` **只在网页腿成功时**调用。网页腿失败却记了，当天后续
+        巡检会直接跳过该账号 —— 那天的积分静默丢掉且不再重试。
+        """
+        from .upstream import webchat
+
+        cfg = self.cfg.schedule
+
+        def _log(fmt: str, *args: Any) -> None:
+            """把 webchat/webagent 的 printf 风格日志接进调度器 logger。"""
+            log.info("[web_active] " + fmt, *args)
+
+        result = await webchat.daily_chat(
+            self.client, auth,
+            model=cfg.web_active_model or webchat.DEFAULT_MODEL,
+            prompt=cfg.web_active_prompt or webchat.DEFAULT_PROMPT,
+            turn_timeout=float(cfg.web_active_timeout_seconds or 120),
+            desktop_leg=bool(cfg.web_active_desktop_leg),
+            log=_log,
+        )
+        if result.get("ok"):
+            # 只有网页腿真的跑完才算今天做过
+            self.pool.mark_daily_chat(entry.uid)
+        web = result.get("web") or {}
+        detail = str(result.get("msg") or result.get("error") or "")
+        if web.get("status"):
+            detail += f" [status={web.get('status')} chunks={web.get('chunks') or 0}]"
+        return {"uid": entry.uid, "realm": entry.realm,
+                "ok": bool(result.get("ok")), "detail": detail[:280]}
 
     async def _activity(self, entry, auth) -> dict:
         """成长任务全自动完成：拉列表 → 逐个 accept（**回读确认**）→ 达标即领奖。

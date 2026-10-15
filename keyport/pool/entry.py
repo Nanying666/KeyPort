@@ -85,6 +85,11 @@ class AccountEntry:
     last_used_at: int = 0
     last_error: str = ""
     last_checkin_at: int = 0
+    # 国际版每日活跃打卡：最近一次**成功**完成的日期时间串（`YYYY-MM-DD HH:MM:SS`）。
+    #
+    # 只在网页腿真正跑完时写入 —— 桌面腿成功或网页腿失败都不写。写早了会让当天
+    # 后续巡检直接跳过该账号，那天的积分静默丢掉且不再重试。
+    last_daily_chat: str = ""
 
     # 状态位
     enabled: bool = True
@@ -293,6 +298,7 @@ class AccountEntry:
             "total_calls": self.total_calls,
             "failed_calls": self.failed_calls,
             "last_checkin_at": self.last_checkin_at,
+            "last_daily_chat": self.last_daily_chat,
             "risk_strikes": self.risk_strikes,
             "last_risk_at": self.last_risk_at,
             "fingerprint": dict(self.fingerprint or {}),
@@ -327,6 +333,7 @@ class AccountEntry:
         self.total_calls = int(state.get("total_calls", 0) or 0)
         self.failed_calls = int(state.get("failed_calls", 0) or 0)
         self.last_checkin_at = int(state.get("last_checkin_at", 0) or 0)
+        self.last_daily_chat = str(state.get("last_daily_chat", "") or "")
         self.risk_strikes = int(state.get("risk_strikes", 0) or 0)
         self.last_risk_at = int(state.get("last_risk_at", 0) or 0)
         raw_fp = state.get("fingerprint")

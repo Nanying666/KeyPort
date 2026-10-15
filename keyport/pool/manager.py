@@ -101,6 +101,7 @@ class AccountPool:
                     last_used_at=int(row["last_used_at"] or 0),
                     last_error=row["last_error"] or "",
                     last_checkin_at=int(row["last_checkin_at"] or 0),
+                    last_daily_chat=row["last_daily_chat"] or "",
                     enabled=bool(row["enabled"]),
                     manual_disabled=bool(row["manual_disabled"]),
                     disabled_reason=row["disabled_reason"] or "",
@@ -624,6 +625,22 @@ class AccountPool:
             self.db.execute(
                 "UPDATE accounts SET last_checkin_at=?, updated_at=? WHERE uid=?",
                 (entry.last_checkin_at, db_now(), uid),
+            )
+
+    def mark_daily_chat(self, uid: str) -> None:
+        """记「国际版每日活跃打卡今天已完成」。
+
+        **只在网页腿真正跑完时调用**：桌面腿成功或网页腿失败都不该记 —— 记早了
+        会让当天后续巡检直接跳过该账号，那天的积分静默丢掉且不再重试。
+        """
+        with self._lock:
+            entry = self._entries.get(uid)
+            if entry is None:
+                return
+            entry.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.db.execute(
+                "UPDATE accounts SET last_daily_chat=?, updated_at=? WHERE uid=?",
+                (entry.last_daily_chat, db_now(), uid),
             )
 
     # ---- 账号 CRUD ----
