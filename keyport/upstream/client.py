@@ -657,6 +657,91 @@ class UpstreamClient:
             auth, ["/v2/report/activity/event", "/report/activity/event"], {"event": event}
         )
 
+    # ---- growth 域原语（实现见 upstream/growth.py）----
+    #
+    # 这里只做转发：原语层需要 `client_for` / `_billing_base` / `billing_headers`
+    # 三件事，而它们都在本模块，故原语通过 client 实例回调自身，避免循环导入。
+
+    async def growth_tasks(self, auth: AccountAuth) -> list[Any]:
+        """growth 任务列表。"""
+        from . import growth
+
+        return await growth.growth_tasks(self, auth)
+
+    async def growth_tasks_raw(self, auth: AccountAuth) -> Any:
+        """任务列表的原始 data 段（运维排查上游字段变化）。"""
+        from . import growth
+
+        return await growth.growth_tasks_raw(self, auth)
+
+    async def growth_task_status(self, auth: AccountAuth, code: str) -> Any:
+        """查询单个任务；不在列表中返回 None。"""
+        from . import growth
+
+        return await growth.growth_task_status(self, auth, code)
+
+    async def accept_growth_task(self, auth: AccountAuth, code: str) -> Any:
+        """接受任务（必须回读 status，HTTP 200 不代表登记成功）。"""
+        from . import growth
+
+        return await growth.accept_growth_task(self, auth, code)
+
+    async def claim_growth_task(self, auth: AccountAuth, code: str) -> Any:
+        """领取任务奖励（路径无 /v2、无 body）。"""
+        from . import growth
+
+        return await growth.claim_growth_task(self, auth, code)
+
+    async def growth_reward_state(self, auth: AccountAuth) -> Any:
+        """连登天数 + 各档兑换状态 + 补签卡余额。"""
+        from . import growth
+
+        return await growth.growth_reward_state(self, auth)
+
+    async def growth_redeem(self, auth: AccountAuth, tier: str,
+                            client_token: str = "") -> Any:
+        """兑换连登奖励档位。"""
+        from . import growth
+
+        return await growth.growth_redeem(self, auth, tier, client_token)
+
+    async def growth_lottery_chances(self, auth: AccountAuth) -> int:
+        """当前抽奖次数余额。"""
+        from . import growth
+
+        return await growth.growth_lottery_chances(self, auth)
+
+    async def growth_lottery_draw(self, auth: AccountAuth,
+                                  client_token: str = "") -> Any:
+        """抽一次奖。"""
+        from . import growth
+
+        return await growth.growth_lottery_draw(self, auth, client_token)
+
+    async def growth_heatmap(self, auth: AccountAuth) -> list[Any]:
+        """活跃地图热力格。"""
+        from . import growth
+
+        return await growth.growth_heatmap(self, auth)
+
+    async def use_makeup_card(self, auth: AccountAuth, target_date: str) -> Any:
+        """对指定日期使用补签卡。"""
+        from . import growth
+
+        return await growth.use_makeup_card(self, auth, target_date)
+
+    async def claim_gift(self, auth: AccountAuth) -> int:
+        """领取新手礼包（每号一次）。"""
+        from . import growth
+
+        return await growth.claim_gift(self, auth)
+
+    async def claim_compensation(self, auth: AccountAuth) -> int:
+        """领取活动补偿（有则领）。"""
+        from . import growth
+
+        return await growth.claim_compensation(self, auth)
+
     async def keepalive(self, auth: AccountAuth) -> dict[str, Any]:
         """Token 保活：读一次额度即刷新活跃（国际版为专属 Token 集中保活）。"""
         data = await self.fetch_credits(auth)

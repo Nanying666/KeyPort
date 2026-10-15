@@ -322,50 +322,152 @@ class Scheduler:
         return {"uid": entry.uid, "realm": entry.realm, "ok": False, "detail": "unknown task"}
 
     async def _checkin(self, entry, auth) -> dict:
-        """签到 → 末尾运行连登管家（兑换已解锁档位 + 抽完抽奖次数）。"""
+        """签到 → 末尾运行**连登管家**（补签保连登 → 兑换已解锁档位 → 抽完次数）。"""
         data = await self.client.daily_checkin(auth)
         ok = bool(data.get("ok"))
         detail = data.get("msg", "checkin")
         if ok:
             self.pool.mark_checkin(entry.uid)
-            # 连登管家：兑换与抽奖（端点不可用时静默跳过，不阻断签到）
-            try:
-                steward = await self.client._billing_post(
-                    auth, ["/v2/billing/streak/redeem", "/billing/streak/redeem"], {}
-                )
-                if steward.get("ok"):
-                    detail += " + steward"
-            except UpstreamError:
-                pass
+            detail += await self._streak_steward(entry, auth)
         return {"uid": entry.uid, "realm": entry.realm, "ok": ok, "detail": detail}
 
-    async def _activity(self, entry, auth) -> dict:
-        """成长任务全自动完成：接取任务 → 行为事件上报点亮 → 自动领取奖励。"""
-        lit = 0
+    async def _streak_steward(self, entry, auth) -> str:
+        """连登管家：补签 → 兑换 → 抽奖（各步独立容错，绝不阻断签到）。
+
+        顺序刻意如此：
+
+        1. **先补签**：连登天数一断就要重攒 7 天，而补签卡的代价远小于此；
+           且补签会改变 `streak.days`，必须在读兑换状态**之前**做。
+        2. **再兑换**：按天数闸挑最高可领档位，同月每档各一次（409 幂等）。
+        3. **最后抽奖**：兑换送的 `chances` 是抽奖次数来源，顺序反了就抽不到。
+        """
+        from .upstream import growth as G
+
+        notes: list[str] = []
         try:
-            await self.client._billing_post(
-                auth, ["/v2/report/activity/tasks", "/report/activity/tasks"], {},
-                method="GET",
-            )
+            state = await self.client.growth_reward_state(auth)
+        except UpstreamError as exc:
+            if G.is_growth_unavailable(exc):
+                return " + 连登管家跳过（企业版）"
+            return ""
+
+        # ---- 1. 补签保连登 ----
+        try:
+            cards = state.makeup_cards.balance
+            if cards > 0:
+                yesterday = G.growth_yesterday_date()
+                cells = await self.client.growth_heatmap(auth)
+                score, known = G.heatmap_day_score(cells, yesterday)
+                # 只在**确认昨日漏签**时补（无该日格 = 无判据，不动）
+                if known and score == 0:
+                    await self.client.use_makeup_card(auth, yesterday)
+                    notes.append("补签+1")
         except UpstreamError:
             pass
-        for event in GROWTH_EVENTS:
-            try:
-                result = await self.client.activity_event(auth, event)
-            except UpstreamError:
+
+        # ---- 2. 兑换连登奖励（挑最高可领档位）----
+        for tier in ("28d", "14d", "7d"):
+            if state.redemption.claimed(tier):
                 continue
-            if result.get("ok"):
-                lit += 1
-        claimed = False
+            if not (state.redemption.available(tier)
+                    or state.redemption.status_of(tier) in ("", "locked")):
+                continue
+            try:
+                result = await self.client.growth_redeem(auth, tier)
+                notes.append(f"兑换{tier}(+{result.credit_granted}分"
+                             f"+{result.chances_granted}次)")
+                break
+            except UpstreamError as exc:
+                if G.is_redeem_already_claimed(exc) or G.is_redeem_not_enough_days(exc):
+                    continue
+                continue
+
+        # ---- 3. 抽完抽奖次数（有上限，防上游返回异常值时死循环）----
         try:
-            claim = await self.client._billing_post(
-                auth, ["/v2/report/activity/reward", "/report/activity/reward"], {}
-            )
-            claimed = bool(claim.get("ok"))
+            chances = await self.client.growth_lottery_chances(auth)
+            drawn = 0
+            credit = 0
+            for _ in range(min(max(chances, 0), 20)):
+                try:
+                    prize = await self.client.growth_lottery_draw(auth)
+                except UpstreamError as exc:
+                    if G.is_lottery_no_chance(exc) or G.is_lottery_disabled(exc):
+                        break
+                    break
+                drawn += 1
+                credit += prize.credit_amount
+            if drawn:
+                notes.append(f"抽奖{drawn}次(+{credit}分)")
         except UpstreamError:
             pass
-        return {"uid": entry.uid, "realm": entry.realm, "ok": lit > 0,
-                "detail": f"events={lit} claimed={claimed}"}
+
+        return (" + " + " ".join(notes)) if notes else ""
+
+    async def _activity(self, entry, auth) -> dict:
+        """成长任务全自动完成：拉列表 → 逐个 accept（**回读确认**）→ 达标即领奖。
+
+        ## 三条实测教训（照抄参考实现，别改）
+
+        1. **领奖端点是 Web 域路径式**：`POST /activity/growth/tasks/<code>/claim`，
+           任务码在路径、**无 body**。原先走的 `/v2/report/activity/reward` 是错端点，
+           「端点对了才有归账可言」。
+        2. **accept 必须回读 status**：实测存在「HTTP 200 + msg=OK 但 status 非
+           accepted」的形态 —— 此时 accept 未真正登记，**后续上报全部不归账**，
+           任务永远点不亮。只看 HTTP 码会把这种静默失败当成功。
+        3. **`prerequisite not met` 是正常前置未满足**，不是故障（如 `black_cat`
+           需要先领养 Buddy）—— 要把它记成 skipped 而不是 fail。
+        """
+        from .upstream import growth as G
+
+        try:
+            tasks = await self.client.growth_tasks(auth)
+        except UpstreamError as exc:
+            if G.is_growth_unavailable(exc):
+                return {"uid": entry.uid, "realm": entry.realm, "ok": True,
+                        "skipped": True, "detail": "成长体系不可用（企业版）"}
+            return {"uid": entry.uid, "realm": entry.realm, "ok": False,
+                    "detail": f"{exc.kind.value}: {exc.message}"}
+
+        if not tasks:
+            return {"uid": entry.uid, "realm": entry.realm, "ok": True,
+                    "detail": "无任务"}
+
+        accepted = prereq = claimed = failed = 0
+        for task in tasks:
+            code = task.task_code
+            if not code:
+                continue
+            # accept：已登记则跳过（幂等），否则接受并**回读确认**
+            if not task.accepted:
+                try:
+                    result = await self.client.accept_growth_task(auth, code)
+                except UpstreamError as exc:
+                    if G.is_prerequisite_not_met(exc):
+                        prereq += 1
+                        continue
+                    failed += 1
+                    continue
+                if not result.ok:
+                    # HTTP 200 但未登记 —— 上报不会归账，如实记为失败
+                    if "prerequisite" in (result.message or "").lower():
+                        prereq += 1
+                    else:
+                        failed += 1
+                    continue
+                accepted += 1
+            # 达标即领奖（进度未满时领奖会被上游拒，不必试）
+            if task.complete or task.accept_status == "completed":
+                try:
+                    await self.client.claim_growth_task(auth, code)
+                    claimed += 1
+                except UpstreamError:
+                    # 已领过 / 未达标都是正常态
+                    pass
+
+        ok = accepted > 0 or claimed > 0 or (failed == 0)
+        detail = (f"tasks={len(tasks)} accepted={accepted} claimed={claimed}"
+                  f" prereq={prereq} failed={failed}")
+        return {"uid": entry.uid, "realm": entry.realm, "ok": ok, "detail": detail}
 
     def _record(self, task: str, entry, outcome: dict) -> None:
         # 跳过（门控）与失败必须分开：跳过是**预期**的正常态（global / 企业版 /
