@@ -35,7 +35,8 @@ from .config import Config, get_config
 from .db import init_db
 from .pool.manager import AccountPool
 from .ratelimit import ClientLimiter
-from .scheduler import Scheduler
+from .scheduler import TASKS, Scheduler
+from .taskjobs import TaskJobManager
 from .upstream.captcha import (
     DEFAULT_PREFIX,
     DEFAULT_REGION,
@@ -127,12 +128,21 @@ def build_context(cfg: Config | None = None) -> AppContext:
     # 告警数据源需要读 WAF IP 级拦截状态（该状态在网关上）
     scheduler.gateway = gateway
     claims = ClaimService(cfg.claim, client, db, captcha=captcha)
+    # 后台任务作业：把一个账号的全量自动任务变成可查询的异步作业
+    # （调度器是同步串行的，一个账号卡住会拖累整轮；作业化后创建即返回）
+    jobs = TaskJobManager(
+        Path(cfg.data_dir) / "task-jobs.json",
+        lambda uid, report: scheduler.run_account_tasks(uid, report),
+        total_actions=len(TASKS),
+        concurrency=cfg.schedule.job_concurrency,
+    )
     ctx = AppContext(
         cfg=cfg, db=db, pool=pool, client=client, refresher=refresher,
         key_store=key_store, request_logger=request_logger, gateway=gateway,
         models=models, scheduler=scheduler, captcha=captcha, claims=claims,
         budget=budget,
         limiter=ClientLimiter(),
+        jobs=jobs,
         started_at=time.time(),
     )
     ctx.admin_auth = AdminAuth(db, cfg)  # type: ignore[attr-defined]
@@ -160,6 +170,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             log.warning("面板初始密码（仅本次显示，请立即登录后修改）：%s", generated)
             log.warning("=" * 64)
         ctx.scheduler.start()
+        # 后台任务作业：先加载磁盘状态（陈旧的 pending/running 会被判为 interrupted），
+        # 再恢复上次退出时未完成的作业 —— 执行器会先回读服务端状态，
+        # 已领奖的项目在内部跳过动作，不会重复领奖。
+        ctx.jobs.start()
+        try:
+            ctx.jobs.resume()
+        except Exception as err:  # noqa: BLE001 - 恢复失败不该阻断启动
+            log.warning("后台任务恢复失败: %s", err)
         if ctx.captcha:
             await ctx.captcha.start()
         if ctx.claims is not None:
@@ -177,6 +195,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 await ctx.claims.stop()
             if ctx.captcha:
                 await ctx.captcha.close()
+            # 作业先停：等正在飞的上游调用返回并把结果记完，再停调度器
+            await ctx.jobs.stop()
             await ctx.scheduler.stop()
             ctx.pool.save_state()
             await ctx.client.aclose()

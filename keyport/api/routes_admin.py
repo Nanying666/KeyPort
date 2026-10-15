@@ -22,6 +22,7 @@ from ..auth.store import (
 from ..auth.zcode import is_zcode_bundle
 from ..config import save_config
 from ..db import now as db_now
+from ..taskjobs import TaskJobError
 from ..upstream.base import UpstreamError
 from ..upstream.claim import ClaimError, is_zcode_plan_account
 from .admin_auth import SESSION_COOKIE, bootstrap_admin_password, client_ip, require_admin
@@ -243,6 +244,43 @@ async def sync_nicknames(request: Request, _: str = Depends(require_admin)):
     record_audit(ctx.db, client_ip(request), "sync_nicknames", "",
                  "ok", f"updated={len(updated)} failed={len(failed)}")
     return {"ok": True, "updated": updated, "failed": failed}
+
+
+@router.get("/task-jobs")
+async def list_task_jobs(request: Request, _: str = Depends(require_admin)):
+    """列出各账号最新的后台任务作业（按更新时间从新到旧）。"""
+    ctx = get_ctx(request)
+    return {"ok": True, "jobs": [j.to_dict() for j in ctx.jobs.list_jobs()]}
+
+
+@router.get("/task-jobs/{uid}")
+async def get_task_job(request: Request, uid: str, _: str = Depends(require_admin)):
+    """查询单个账号的后台任务作业。"""
+    ctx = get_ctx(request)
+    job = ctx.jobs.get_job(uid)
+    return {"ok": True, "job": job.to_dict() if job else None}
+
+
+@router.post("/task-jobs/{uid}")
+async def start_task_job(request: Request, uid: str,
+                         _: str = Depends(require_admin)):
+    """为账号排入一次全量自动任务作业（**创建即返回**，执行在后台）。"""
+    ctx = get_ctx(request)
+    entry = ctx.pool.get(uid)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    try:
+        job, started = ctx.jobs.start_job(
+            uid, trigger="manual", nickname=entry.nickname, realm=entry.realm,
+            # 自动任务开关：KeyPort 的排程是**逐任务**开关（没有全局 enabled），
+            # 用成长任务开关作为「自动任务体系是否启用」的语义代表。
+            auto_enabled=bool(ctx.cfg.schedule.activity_enabled),
+        )
+    except TaskJobError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    record_audit(ctx.db, client_ip(request), "task_job_start", uid,
+                 "ok" if started else "existing")
+    return {"ok": True, "started": started, "job": job.to_dict()}
 
 
 @router.get("/selection/candidates")

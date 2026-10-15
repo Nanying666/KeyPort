@@ -32,6 +32,8 @@ class AppContext:
     # 当日积分预算闸（全局准入控制）与客户端维度限流器
     budget: Any = None
     limiter: Any = None
+    # 后台任务作业管理器
+    jobs: Any = None
     started_at: float = 0.0
     login_states: dict[str, Any] = None  # type: ignore[assignment]
 

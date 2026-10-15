@@ -259,6 +259,10 @@ class ScheduleConfig:
     # 0 = 精确整点（保留旧行为）。
     jitter_minutes: int = 0
 
+    # 后台任务作业并发上限（同时跑几个账号的全量任务）。
+    # 不宜大：每个作业都会连续打上游，并发高了等同人工刷接口。
+    job_concurrency: int = 2
+
 
 @dataclass
 class GuardConfig:

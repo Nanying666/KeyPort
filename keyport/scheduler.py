@@ -21,7 +21,7 @@ from typing import Any
 from .config import Config
 from .db import Database, now as db_now
 from .pool.manager import AccountPool
-from .upstream.base import UpstreamError
+from .upstream.base import ErrorKind, UpstreamError
 from .upstream.client import UpstreamClient
 
 log = logging.getLogger("keyport.scheduler")
@@ -273,6 +273,33 @@ class Scheduler:
             self._record(task, entry, outcome)
         self.last_results = results
         return results
+
+    async def run_account_tasks(self, uid: str, report=None) -> None:
+        """把一个账号的**全部**自动任务跑一遍（供后台任务作业调用）。
+
+        `report(kind, code, result, completed)` 上报进度。取消在**步骤之间**观测 ——
+        正在飞的上游调用会跑完并如实上报结果，不能假装没发生。
+        """
+        entry = self.pool.get(uid)
+        if entry is None:
+            raise UpstreamError(ErrorKind.UNKNOWN, 404, "account not found")
+        for task in TASKS:
+            gate = self._gate_reason(task, entry)
+            if gate:
+                if report:
+                    report("result", task, {"task_code": task, "ok": True,
+                                            "detail": f"skipped: {gate}"}, True)
+                continue
+            if report:
+                report("task_start", task)
+            outcome = await self._run_for(task, entry)
+            self._record(task, entry, outcome)
+            if report:
+                report("result", task, {
+                    "task_code": task,
+                    "ok": bool(outcome.get("ok")),
+                    "detail": str(outcome.get("detail", ""))[:200],
+                }, True)
 
     def _gate_reason(self, task: str, entry: Any) -> str:
         """该账号是否应跳过此任务；返回原因（空串 = 照常执行）。"""
