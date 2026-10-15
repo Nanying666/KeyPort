@@ -66,7 +66,7 @@ def test_realm_for_model_disabled_returns_empty(tmp_path: Path):
     cfg = make_test_config(tmp_path)
     cfg.pool.route_by_model = False
     c = build_context(cfg)
-    c.models._cache["zai"] = (0.0, [{"id": "glm-5.3"}])
+    c.models._raw["zai"] = (0.0, [{"id": "glm-5.3"}])
     assert c.gateway.realm_for_model("glm-5.3") == ""
 
 
@@ -94,9 +94,11 @@ async def test_selection_limited_to_owner_realm(ctx):
 
 
 def test_realm_for_model_cross_realm_duplicate_returns_none(tmp_path: Path):
-    """跨域重名模型不强制路由（无法判定归属）。"""
+    """跨域重名模型不强制路由（无法判定归属），但两个域都要能被列出。"""
     cfg = make_test_config(tmp_path)
     c = build_context(cfg)
-    c.models._cache["zai"] = (0.0, [{"id": "shared-model"}])
-    c.models._cache["global"] = (0.0, [{"id": "shared-model"}])
+    c.models._raw["zai"] = (0.0, [{"id": "shared-model"}])
+    c.models._raw["global"] = (0.0, [{"id": "shared-model"}])
     assert c.models.realm_for_model("shared-model") is None
+    # 归属判定读的是未过滤目录：两个域都得算「能提供该模型」
+    assert sorted(c.models.realms_for_model("shared-model")) == ["global", "zai"]

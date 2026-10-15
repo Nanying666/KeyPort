@@ -59,6 +59,8 @@
     "pick_gap_ms": 100,
     "route_by_model": true,
 
+    "realm_priority": [],
+
     "retry_429_times": 5,
     "retry_429_wait": 60,
     "retry_429_wait_max": 120,
@@ -146,20 +148,25 @@
       "enabled": true,
       "chat_base": "https://copilot.tencent.com",
       "billing_base": "https://www.codebuddy.cn",
-      "models_base": ""
+      "models_base": "",
+      "models_free_only": false,
+      "extra_models": []
     },
     "global": {
       "enabled": true,
       "chat_base": "https://www.workbuddy.ai",
       "billing_base": "https://www.workbuddy.ai",
       "models_base": "",
-      "models_free_only": true
+      "models_free_only": true,
+      "extra_models": []
     },
     "zai": {
       "enabled": true,
       "chat_base": "https://api.z.ai/api/coding/paas/v4",
       "billing_base": "https://api.z.ai/api",
-      "models_base": "https://api.z.ai/api"
+      "models_base": "https://api.z.ai/api",
+      "models_free_only": false,
+      "extra_models": []
     }
   }
 }

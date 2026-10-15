@@ -230,6 +230,45 @@ zai:glm-5.3-flash             → 强制 z.ai（GLM Coding Plan）
 > 未加域前缀时，网关会按「模型归属域」自动路由：模型只在一个域提供时限定该域选号
 > （由 `pool.route_by_model` 控制，默认开启）；跨域重名或目录未命中时保持「不限域」。
 
+### 跨域兜底选号（`pool.realm_priority`）
+
+只按「模型归属域」路由有个硬伤：**一个域打不动就整单失败**。典型场景是 global 的
+0 积分免费模型被上游按「账号 + 模型」限流（`6004 usage exceeds frequency limit`），
+9 个 global 账号全部命中时，下游只能吃 429 —— 而 cn 明明有同名模型能跑，只是要花积分。
+
+配置域优先级即可按「先便宜后兜底」的顺序选号：
+
+```jsonc
+"pool": { "realm_priority": ["global", "cn", "zai"] }
+```
+
+- 对同一个模型，**先只在优先级最高的域里选号**；该域账号全部不可服务
+  （冷却 / 熔断 / 模型级限流 / 该域尝试预算耗尽）才降级到下一个域。
+- 每个域独立享有 `max_retries` 次尝试预算，不会因为 global 账号多就把预算烧光、
+  永远轮不到 cn。
+- 显式域前缀（`cn:xxx`）是调用方的明确指定，**不参与兜底**，不会被自动改写。
+- 留空 = 关闭该特性，行为与老版本逐字一致。
+
+> **两个目录是分开的**：`models_free_only` 是「下游只看得到免费档」的**展示**策略，
+> 只作用于 `/v1/models`；路由可用性判定（哪个域能提供这个模型）用的是**未过滤**目录。
+> 若两者混用，cn 那份付费同名模型被过滤后就会从路由可用域里消失，该模型只剩一个
+> 归属域，兜底也就无从谈起 —— 这正是早期版本的真实故障。
+>
+> **`extra_models` 解决「能调用但查不到」**：上游模型目录接口偶尔不下发某些实际可用
+> 的模型。这类模型不补录就会因「归属未知」而被不限域选号随机丢到别的域（白耗那个
+> 域的额度）。补录后归属即确定；**是否广告给下游**则另外决定：
+>
+> ```jsonc
+> // 写法一：确定免费 → 出现在下游清单
+> "realms": { "global": { "extra_models": ["hy4-preview-f"] } }
+>
+> // 写法二：会扣积分（倍率未知）→ 不进下游清单，但保留归属，调用时仍打向 global
+> "realms": { "global": { "extra_models": [{"id": "hy4-preview-f"}] } }
+> ```
+>
+> 「隐藏可见性」与「保留路由归属」是两件事：把模型从目录里彻底删掉，调用时反而会
+> 因为查不到归属而被随机路由到别的域（可能更贵）。所以对付费模型应该用写法二。
+
 ---
 
 ## 核心能力
@@ -604,6 +643,7 @@ KP_CONFIG_FILE=/app/data/config.json     # 配置文件位置（容器里推荐�
 | | `risk_cooldown_*` / `risk_ban_strikes` / `risk_strike_decay_seconds` | 风控指数退避、升级禁用阈值、strikes 衰减窗口 |
 | | `risk_auto_rotate` | 风控升级禁用时自动换发设备档案 |
 | | `top_k` / `pick_gap_ms` | 选号短名单大小、防惊群间隔 |
+| | `realm_priority` | 跨域兜底选号的域优先级（如 `["global","cn","zai"]`）；靠前域账号全部不可服务才降级到下一个域。留空 = 关闭（保持「模型唯一归属才限定域」） |
 | `claim` | `enabled` / `round_interval_seconds` | 限时套餐领取开关与自动轮间隔（0 = 关闭轮） |
 | | `auto_on_add` / `cooldown_seconds` / `max_accounts_per_round` | 入池即领、失败退避、单轮账号上限 |
 | `install` | `enabled` / `auto_on_add` / `timeout_seconds` | 官方首启安装序仿真 |
@@ -620,7 +660,8 @@ KP_CONFIG_FILE=/app/data/config.json     # 配置文件位置（容器里推荐�
 | | `session_ttl_seconds` / `audit_enabled` | 会话有效期、审计开关 |
 | | `global_allowlist` / `global_blocklist` | 全局 IP 白 / 黑名单（CIDR） |
 | `realms` | `enabled` / `chat_base` / `billing_base` / `models_base` | 各域端点（`CodeBuddy` / `WorkBuddy` / `zai`） |
-| | `models_free_only` | 仅列出 0 倍率免费模型（`WorkBuddy` 默认开启） |
+| | `models_free_only` | 仅列出 0 倍率免费模型（`WorkBuddy` 默认开启）。**只影响展示，不阻断调用**，也不影响跨域兜底的可用域判定 |
+| | `extra_models` | 上游模型目录未下发、但实际可调用的模型，补进该域目录。字符串 `"m"` = 按 0 倍率（免费）处理、会广告给下游；对象 `{"id":"m"}` = 倍率未知，**不进下游清单但保留路由归属**（调用时打向正确的域）；也可写 `{"id":"m","credit_factor":0.29}` 显式声明 |
 
 ### 人机验证（`captcha`）
 

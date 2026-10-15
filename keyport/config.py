@@ -113,6 +113,17 @@ class PoolConfig:
     # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并补跑安装序
     risk_auto_rotate: bool = True
 
+    # ---- 跨域兜底选号 ----
+    # 选号域优先级链，例如 ["global", "cn", "zai"]（越靠前越优先）。
+    #
+    # 非空时：对同一个模型，先只在靠前域的账号里选号；该域账号全部不可服务
+    # （冷却 / 模型级限流 / 尝试预算耗尽）才降级到下一个域兜底。
+    # 典型用途：global 的 0 积分免费模型先跑，都打不动了再用 cn 的同一模型
+    # （有倍率、要花积分）兜底，而不是直接失败。
+    #
+    # 留空（默认）= 关闭该特性，保持旧口径「模型唯一归属才限定域，否则不限域」。
+    realm_priority: list[str] = field(default_factory=list)
+
 
 @dataclass
 class SessionStickyConfig:
@@ -257,7 +268,22 @@ class RealmConfig:
     models_base: str = ""
     # 仅暴露免费（0 倍率）模型。用于把 WorkBuddy 国际版的大模型列表
     # 收敛到 0 积分模型，避免下游看到一堆用不了/高消耗的付费模型。
+    #
+    # 注意：该开关只影响「模型目录的展示与选号归属判定」，**不阻断调用** ——
+    # 想硬性禁止下游使用付费模型，应在密钥上配置 `model_allow`。
     models_free_only: bool = False
+
+    # 上游模型目录接口没有下发、但实际可调用的模型（补进该域目录）。
+    #
+    # 实测存在这种情况：某模型能正常出结果，却不在 `fetch_models` 返回的目录里
+    # ——不补进来就会因「归属未知」而被不限域选号随机落到别的域（白耗那个域的额度）。
+    #
+    # 两种写法语义不同：
+    #   - 字符串 `"hy4-preview-f"`：简写，按 0 倍率（免费）处理 → 会进下游清单。
+    #   - 对象 `{"id": "hy4-preview-f"}`：倍率未知 → 被 `models_free_only` 剔除，
+    #     **不进下游清单**，但仍在路由目录里，调它时打向正确的域（不随机串域）。
+    #     要显式声明倍率就写 `{"id": "...", "credit_factor": 0.29}`。
+    extra_models: list = field(default_factory=list)
 
 
 def _default_realms() -> dict[str, RealmConfig]:

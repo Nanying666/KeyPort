@@ -172,6 +172,9 @@ class ChatSession:
         - **5xx 等一般错误**：原地重试 `retry_5xx_times` 次；耗尽后账号冷却
           `cooling_seconds` 并换号。
         - **额度耗尽 / 鉴权失效**：换号；有回退 Key 时先试回退通道。
+        - **跨域兜底**：`pool.realm_priority` 非空时，先只在优先级最高的域里选号；
+          该域账号全部不可服务（冷却 / 模型级限流 / 本域尝试预算耗尽）才降级到
+          下一个域兜底。显式域前缀（`cn:xxx`）不参与兜底。
         """
         gw = self.gateway
         cfg = gw.cfg
@@ -179,12 +182,10 @@ class ChatSession:
         realm, bare_model = resolve_model_with_alias(
             self.params.model, cfg, self.params.realm)
         self.params.model = bare_model
-        self.params.realm = realm
-        # 无域前缀时按模型归属域路由：模型只在一个域提供 → 限定该域选号，
-        # 否则高余额域（z.ai token 额度）会抢走 workbuddy 的免费模型。
-        if not realm:
-            realm = gw.realm_for_model(bare_model)
-            self.params.realm = realm
+        # 选号域链（优先 → 兜底）。无域前缀时：模型只在一个域提供就限定该域，
+        # 多个域都能提供则按 pool.realm_priority 给出「先用哪个域、打不动再降级到哪」
+        chain = gw.realm_chain(bare_model, explicit=realm)
+        self.params.realm = chain[0]
 
         prompt_text = load_prompt_text(
             cfg.prompt.mode, cfg.prompt.file, cfg.prompt.default_text
@@ -195,13 +196,36 @@ class ChatSession:
 
         last_err: UpstreamError | None = None
         attempts = max(1, self.params.max_retries)
-        while self.retries <= attempts:
+        chain_idx = 0
+        realm_spent = 0
+
+        def _next_realm() -> bool:
+            """当前域打不动了 → 降级到链上的下一个域兜底；无下一个域返回 False。"""
+            nonlocal chain_idx, realm_spent
+            if chain_idx + 1 >= len(chain):
+                return False
+            chain_idx += 1
+            realm_spent = 0
+            self.params.realm = chain[chain_idx]
+            # 换域换了一套账号：旧域试过的 uid 对本域没有意义，清掉让本域完整重试
+            self._tried.clear()
+            return True
+
+        while True:
+            # 本域尝试预算耗尽（典型场景：该模型把本域账号全打限流了）→ 降级兜底
+            if realm_spent > attempts:
+                if not _next_realm():
+                    break
+                continue
             entry = gw.pool.pick(
-                realm=realm, model=self.params.model,
+                realm=chain[chain_idx], model=self.params.model,
                 conversation_id=self.params.conversation_id, tried=self._tried,
             )
             if entry is None:
-                break
+                # 本域已无健康/有容量的账号：换下一个域兜底，没有则结束
+                if not _next_realm():
+                    break
+                continue
             self._tried.add(entry.uid)
             # 并发槽由 _attempt 全权持有与释放（内部会因等待类重试反复让出 / 取回），
             # 这里不参与，避免「未持槽却释放」把别人的槽位算漏。
@@ -217,6 +241,7 @@ class ChatSession:
                 if not exc.should_failover:
                     break
                 self.retries += 1
+                realm_spent += 1
                 continue
 
             try:
@@ -228,6 +253,7 @@ class ChatSession:
                 if not exc.should_failover:
                     break
                 self.retries += 1
+                realm_spent += 1
 
         if last_err is not None:
             raise last_err
@@ -283,6 +309,13 @@ class ChatSession:
                 self.resp = resp
                 self.auth = current
                 self.uid = entry.uid
+                # 之前几次换号的失败只是**过程**：本次已经拿到上游流。
+                # 必须清掉残留的错误态，否则 finish() 会拿旧错误收尾 ——
+                # 状态码记成 429、error 留着旧文案，并因 `not self.error` 不成立
+                # 而**跳过 record_success**（调用数 / 账本 / 积分全部漏记）。
+                # 跨域兜底与普通换号都会走到这里，所以这不是边缘情况。
+                self.error = ""
+                self.status = int(getattr(resp, "status_code", 200) or 200)
                 self._holding = True   # 槽位转交本会话，由 close() 释放
                 holding = False
                 gw.pool.record_success_meta(entry.uid, fallback=use_fallback)
@@ -568,6 +601,41 @@ class Gateway:
         self.request_logger = request_logger
         # 模型注册表：用于无域前缀请求按模型归属自动路由（可为 None，测试常见）
         self.models = models
+
+    def realm_chain(self, model_id: str, explicit: str = "") -> list[str]:
+        """选号域链（优先 → 兜底）；元素为空串表示「不限域」。
+
+        - **显式域前缀**（`cn:xxx` / `global:xxx`）：只用该域，不跨域兜底 ——
+          调用方已明确指定，擅自改写会违背其意图。
+        - **`pool.realm_priority` 为空**（默认）：保持旧口径 —— 模型唯一归属时
+          限定该域，跨域重名或未知则不限域。
+        - **非空**：所有能提供该模型的域按优先级排序；靠前域的账号全部不可服务
+          时才降级到下一个域兜底。典型用法 `["global", "cn"]` —— global 的 0 积分
+          免费模型先跑，都打不动了再用 cn 的同名模型（有倍率、要花积分）兜底，
+          而不是直接对下游报 429。
+
+        目录里没有任何域提供该模型（归属未知）→ 返回 `[""]`，不擅自猜测。
+        """
+        if explicit:
+            return [explicit]
+        if not self.cfg.pool.route_by_model or self.models is None:
+            return [""]
+        try:
+            owners = self.models.realms_for_model(model_id)
+        except Exception:  # noqa: BLE001 - 路由提示失败不应影响请求
+            return [""]
+
+        priority = [r for r in (self.cfg.pool.realm_priority or []) if r]
+        if not priority:
+            return [owners[0] if len(owners) == 1 else ""]
+        if not owners:
+            return [""]
+
+        enabled = set(self.cfg.enabled_realms())
+        ordered = [r for r in priority if r in owners and r in enabled]
+        # 能提供该模型、但没写进优先级的域，接在末尾兜底
+        ordered += [r for r in owners if r not in ordered and r in enabled]
+        return ordered or [""]
 
     def realm_for_model(self, model_id: str) -> str:
         """模型唯一归属域；未知/跨域重名/未启用该特性时返回空串（不限域）。"""
