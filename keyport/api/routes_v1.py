@@ -95,15 +95,14 @@ def _error_body(message: str, err_type: str = "invalid_request_error") -> dict:
 
 
 def _conversation_id(body: dict[str, Any], headers: dict[str, str]) -> str:
-    for header in ("x-conversation-id", "x-session-id", "x-trace-id"):
-        value = headers.get(header)
-        if value:
-            return str(value)
-    for key in ("conversation_id", "conversationId", "session_id", "user"):
-        value = body.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ""
+    """提取会话键（含内容派生回退，见 `upstream.cache_key`）。
+
+    刻意**不再**把顶层 `user` 当会话键：user 维度粒度过粗，一个用户的全部并行
+    对话会被钉到同一账号，粘性范围远超上游 prompt cache 的对话级边界。
+    """
+    from ..upstream.cache_key import extract_session_key
+
+    return extract_session_key(body, headers)
 
 
 def _fail_status(exc: UpstreamError) -> int:
@@ -351,7 +350,8 @@ async def responses_api(
         async def _gen():
             try:
                 async for event in responses_proto.stream_events(
-                    session.iter_lines(), session.params.model, response_id
+                    session.iter_lines(), session.params.model, response_id,
+                    repair=session.markup_repair,
                 ):
                     yield event
             finally:
@@ -435,7 +435,8 @@ async def messages_api(
         async def _gen():
             try:
                 async for event in anthropic.stream_events(
-                    session.iter_lines(), session.params.model, msg_id
+                    session.iter_lines(), session.params.model, msg_id,
+                    repair=session.markup_repair,
                 ):
                     yield event
             finally:

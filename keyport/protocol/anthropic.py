@@ -73,7 +73,12 @@ def _blocks_text(blocks: list[dict[str, Any]]) -> str:
 
 
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
-    """tool_calls.function.arguments（JSON 字符串）→ dict。"""
+    """tool_calls.function.arguments（JSON 字符串）→ dict。
+
+    解析失败时返回 `{"_raw": raw}` 而不是空 dict：**不伪造「参数合法」的外观**，
+    把原始残缺内容如实透出，让客户端能自己判断。截断形态的调用由
+    `upstream.truncation.drop_truncated_tool_calls` 在上游侧先剔除。
+    """
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str) and raw.strip():
@@ -416,11 +421,20 @@ def response_from_openai(
     }
 
 
-async def stream_events(chunks: Any, model: str, msg_id: str) -> Any:
+async def stream_events(chunks: Any, model: str, msg_id: str,
+                        repair: Any = None) -> Any:
     """把上游 OpenAI chunk 异步流转换为 Anthropic 事件流（async generator）。
 
     事件顺序：message_start → (content_block_start/delta)* → content_block_stop*
     → message_delta → message_stop。
+
+    `repair` 是 `keyport.upstream.markup.MarkupRepair`（可为 None）：模型把原生工具
+    调用吐成正文标记时，由它还原成 `tool_use` 块。
+
+    为此**正文块改为延迟开启**：正文先进修复器缓冲，只有确认是普通正文才发
+    `content_block_start`。否则「先开了文本块、随后才从缓冲里还原出工具调用」会
+    导致文本块与工具块交错，Anthropic 客户端解析不了。一旦上游给出结构化
+    `tool_calls`，说明这轮不是标记泄漏，立即把缓冲正文原样吐出。
     """
     from ..upstream.sse import iter_sse_json, sse_line
 
@@ -445,6 +459,83 @@ async def stream_events(chunks: Any, model: str, msg_id: str) -> Any:
     finish_reason = "stop"
     usage: dict[str, Any] = {}
 
+    def _text_events(text: str):
+        """产出正文事件；调用方保证 text 非空。"""
+        return [
+            sse_line({
+                "type": "content_block_delta",
+                "index": text_index,
+                "delta": {"type": "text_delta", "text": text},
+            }, "content_block_delta"),
+        ]
+
+    def _open_text():
+        return sse_line({
+            "type": "content_block_start",
+            "index": text_index,
+            "content_block": {"type": "text", "text": ""},
+        }, "content_block_start")
+
+    def _tool_events(tc: dict):
+        """把一个上游 tool_call 分片转成 Anthropic tool_use 事件。"""
+        nonlocal next_index
+        out = []
+        tci = int(tc.get("index") or 0)
+        if tci not in tool_index:
+            if text_open:
+                out.append(sse_line({"type": "content_block_stop", "index": text_index},
+                                    "content_block_stop"))
+            tool_index[tci] = next_index
+            next_index += 1
+            fn = tc.get("function") or {}
+            out.append(sse_line({
+                "type": "content_block_start",
+                "index": tool_index[tci],
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tc.get("id") or f"toolu_{tci}",
+                    "name": fn.get("name", ""),
+                    "input": {},
+                },
+            }, "content_block_start"))
+        args = (tc.get("function") or {}).get("arguments")
+        if isinstance(args, str) and args:
+            out.append(sse_line({
+                "type": "content_block_delta",
+                "index": tool_index[tci],
+                "delta": {"type": "input_json_delta", "partial_json": args},
+            }, "content_block_delta"))
+        return out
+
+    def _markup_tool_events(call: Any, seq: int):
+        """标记还原出的调用是**完整**的，每个独占一个新 index（不走上游分片合并）。"""
+        nonlocal next_index
+        out = []
+        if text_open:
+            out.append(sse_line({"type": "content_block_stop", "index": text_index},
+                                "content_block_stop"))
+        slot = next_index
+        next_index += 1
+        tool_index[-(seq + 1)] = slot      # 负数键避开上游 index 命名空间
+        out.append(sse_line({
+            "type": "content_block_start",
+            "index": slot,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_mk_{seq}",
+                "name": call.name,
+                "input": {},
+            },
+        }, "content_block_start"))
+        out.append(sse_line({
+            "type": "content_block_delta",
+            "index": slot,
+            "delta": {"type": "input_json_delta", "partial_json": call.arguments},
+        }, "content_block_delta"))
+        return out
+
+    markup_seq = 0
+
     async for chunk in iter_sse_json(chunks):
         if chunk.get("usage"):
             usage = chunk["usage"]
@@ -458,50 +549,62 @@ async def stream_events(chunks: Any, model: str, msg_id: str) -> Any:
             if not isinstance(delta, dict):
                 continue
 
+            raw_tcs = [tc for tc in (delta.get("tool_calls") or []) if isinstance(tc, dict)]
             text = delta.get("content")
-            if isinstance(text, str) and text:
+            text = text if isinstance(text, str) and text else ""
+
+            if raw_tcs:
+                # 上游给出了结构化调用 → 这轮不是标记泄漏。把缓冲正文原样吐出，
+                # 之后的正文也不再进修复器（直接透传）。
+                if repair is not None and repair.enabled():
+                    pending = repair.flush()
+                    if pending:
+                        if not text_open:
+                            text_open = True
+                            yield _open_text()
+                        for ev in _text_events(pending):
+                            yield ev
+                    repair = None
+                if text:
+                    if not text_open:
+                        text_open = True
+                        yield _open_text()
+                    for ev in _text_events(text):
+                        yield ev
+                for tc in raw_tcs:
+                    for ev in _tool_events(tc):
+                        yield ev
+                continue
+
+            if text:
+                if repair is not None and repair.enabled():
+                    emit, calls = repair.feed(text)
+                    if emit:
+                        if not text_open:
+                            text_open = True
+                            yield _open_text()
+                        for ev in _text_events(emit):
+                            yield ev
+                    for call in calls:
+                        for ev in _markup_tool_events(call, markup_seq):
+                            yield ev
+                        markup_seq += 1
+                    continue
                 if not text_open:
                     text_open = True
-                    yield sse_line({
-                        "type": "content_block_start",
-                        "index": text_index,
-                        "content_block": {"type": "text", "text": ""},
-                    }, "content_block_start")
-                yield sse_line({
-                    "type": "content_block_delta",
-                    "index": text_index,
-                    "delta": {"type": "text_delta", "text": text},
-                }, "content_block_delta")
+                    yield _open_text()
+                for ev in _text_events(text):
+                    yield ev
 
-            for tc in delta.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                tci = int(tc.get("index") or 0)
-                if tci not in tool_index:
-                    if text_open:
-                        text_open = False
-                        yield sse_line({"type": "content_block_stop", "index": text_index},
-                                       "content_block_stop")
-                    tool_index[tci] = next_index
-                    next_index += 1
-                    fn = tc.get("function") or {}
-                    yield sse_line({
-                        "type": "content_block_start",
-                        "index": tool_index[tci],
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tc.get("id") or f"toolu_{tci}",
-                            "name": fn.get("name", ""),
-                            "input": {},
-                        },
-                    }, "content_block_start")
-                args = (tc.get("function") or {}).get("arguments")
-                if isinstance(args, str) and args:
-                    yield sse_line({
-                        "type": "content_block_delta",
-                        "index": tool_index[tci],
-                        "delta": {"type": "input_json_delta", "partial_json": args},
-                    }, "content_block_delta")
+    # 流尾：修复器可能还握着未判定的尾巴（含未闭合的标记块），原样交还
+    if repair is not None and repair.enabled():
+        tail = repair.flush()
+        if tail:
+            if not text_open:
+                text_open = True
+                yield _open_text()
+            for ev in _text_events(tail):
+                yield ev
 
     if text_open:
         yield sse_line({"type": "content_block_stop", "index": text_index}, "content_block_stop")

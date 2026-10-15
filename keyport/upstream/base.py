@@ -39,9 +39,21 @@ class UpstreamError(Exception):
     message: str = ""
     body: str = ""
     retry_after: float = 0.0
+    # 原始响应头：重置时刻的第三级来源（`Retry-After` / `Retry-After-Ms` /
+    # `X-Ratelimit-Reset`）。取不到时不臆造 —— 调用方回落本地有界退避。
+    headers: dict[str, str] = field(default_factory=dict)
 
     def __str__(self) -> str:  # pragma: no cover - 展示用
         return f"UpstreamError(kind={self.kind.value}, status={self.status}, msg={self.message})"
+
+    def reset_at(self, now: float | None = None):
+        """解析上游明示的重置时刻（三级来源，见 `upstream.resetat`）。
+
+        返回 `ResetAt`；`usable` 为假时必须回落本地有界退避。
+        """
+        from .resetat import resolve_reset_at
+
+        return resolve_reset_at(self.body, self.headers, now)
 
     @property
     def should_failover(self) -> bool:
@@ -142,12 +154,25 @@ class AccountAuth:
     # 有档案时身份头按档案出值（一号一台设备）；无档案时按 uid 稳定派生，
     # 绝不用宿主机真实形态（那会形成多账号同设备关联信号）。
     fingerprint: object | None = None
+    # 账号级出站代理（出口线路）：'' = 未指定（跟随全局默认），'direct' = 显式直连，
+    # 其余为代理 URL。N 个账号共用同一出口 IP 会在上游聚成「一个 IP 挂 N 个号」的
+    # 强关联信号，按账号分散出口是防封的主要手段。
+    egress_proxy: str = ""
 
     def is_global(self) -> bool:
         return self.realm == "global"
 
     def is_zai(self) -> bool:
         return self.realm == "zai"
+
+    def is_enterprise(self) -> bool:
+        """企业版账号（无个人成长体系）。
+
+        计算属性、不落盘：避免与业务字段漂移。企业版打成长端点上游直接 403
+        （`growth system is only available for personal users`），执行任何成长
+        任务都是零收益白跑 —— 最危险的是这类「静默无效」在日志里看不出异常。
+        """
+        return bool(self.enterprise_id)
 
     def is_anthropic(self) -> bool:
         return self.protocol == "anthropic"

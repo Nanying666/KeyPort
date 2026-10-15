@@ -218,7 +218,14 @@ def repack_tool_result_blocks(msgs: list[Any]) -> tuple[list[Any], bool]:
 
 
 def sanitize_fingerprints(obj: dict[str, Any]) -> None:
-    """递归清洗请求体里的指纹字段（就地修改）。"""
+    """清洗请求体里的指纹（就地修改）。
+
+    两层互补，缺一不可：
+
+    1. **按键名删字段**（`FINGERPRINT_KEYS`）：挡结构化字段形态。
+    2. **文本级净化**（`upstream.sanitize`）：上游内容审核按**逐字精确匹配**拦截
+       客户端注入的模板句，而模板句写在正文里 —— 只删键名挡不住它。
+    """
     stack: list[Any] = [obj]
     while stack:
         cur = stack.pop()
@@ -230,6 +237,10 @@ def sanitize_fingerprints(obj: dict[str, Any]) -> None:
                 stack.append(cur[key])
         elif isinstance(cur, list):
             stack.extend(cur)
+
+    from .sanitize import sanitize_body
+
+    sanitize_body(obj)
 
 
 # ---- 长上下文压缩投影 ----

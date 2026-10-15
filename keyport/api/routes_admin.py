@@ -217,6 +217,35 @@ async def list_accounts(request: Request, _: str = Depends(require_admin)):
     }
 
 
+@router.get("/selection/candidates")
+async def selection_candidates(
+    request: Request, realm: str = "", model: str = "",
+    _: str = Depends(require_admin),
+):
+    """候选队列预览：**只读**，复现「如果现在发一个请求，会怎么排」。
+
+    排障时最常见的问题不是"选号坏了"，而是"为什么总选它 / 为什么跳过它" ——
+    此前只能靠读代码猜。
+    """
+    ctx = get_ctx(request)
+    rows = ctx.pool.preview_candidates(realm=realm, model=model)
+    return {
+        "realm": realm,
+        "model": model,
+        "candidates": rows,
+        "notice": "只读预览，不写入任何状态；条件探索会写状态故不体现",
+    }
+
+
+@router.get("/selection/balance")
+async def selection_balance(
+    request: Request, hours: int = 24, _: str = Depends(require_admin),
+):
+    """选号均衡度：偏斜倍数 / 覆盖率 / 判定与排查建议。"""
+    ctx = get_ctx(request)
+    return ctx.pool.selection_balance(hours)
+
+
 @router.get("/overview")
 async def overview(request: Request, _: str = Depends(require_admin)):
     ctx = get_ctx(request)

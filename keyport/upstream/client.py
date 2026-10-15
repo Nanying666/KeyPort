@@ -134,35 +134,96 @@ def _models_from_entitlements(data: Any) -> list[dict[str, Any]]:
 
 
 class UpstreamClient:
-    """上游调用封装（复用单个 AsyncClient 连接池）。"""
+    """上游调用封装。
+
+    按**出口线路**复用连接池：同一出口（含「未指定/直连」）共用一个
+    `httpx.AsyncClient`，不同出口各自独立，避免把 A 线路的连接复用给配了 B 线路
+    的账号。出口在构造时按账号解析，因此换号重试会自动换到该账号的线路。
+    """
 
     def __init__(self, cfg: Config, captcha: Any = None):
         self.cfg = cfg
         self.captcha = captcha
         self._client: httpx.AsyncClient | None = None
+        # 出口 key → AsyncClient（key 为 '' / 'direct' / 代理 URL）
+        self._clients: dict[str, httpx.AsyncClient] = {}
+
+    def _timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(
+            self.cfg.upstream.timeout_seconds,
+            connect=15.0,
+            read=self.cfg.upstream.idle_timeout_seconds,
+        )
 
     async def client(self) -> httpx.AsyncClient:
+        """默认客户端（不带代理）。"""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    self.cfg.upstream.timeout_seconds,
-                    connect=15.0,
-                    read=self.cfg.upstream.idle_timeout_seconds,
-                ),
+                timeout=self._timeout(),
                 follow_redirects=False,
                 limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
             )
         return self._client
 
+    def resolve_egress(self, auth: AccountAuth | None = None) -> str:
+        """解析该账号最终生效的出口配置（三态，见 `upstream.egress`）。
+
+        `auth.egress_proxy` 为账号级配置（'' = 未指定 / 'direct' = 显式直连 /
+        代理 URL），未指定时继承 `upstream.egress_proxy_default`。
+        """
+        from .egress import resolved_egress
+
+        own = getattr(auth, "egress_proxy", "") if auth is not None else ""
+        return resolved_egress(own, self.cfg.upstream.egress_proxy_default)
+
+    async def client_for(self, auth: AccountAuth | None = None) -> httpx.AsyncClient:
+        """取该账号出口对应的客户端。
+
+        `egress_strict` 开启时，出口配置非法**直接抛错**，绝不回落到直连 ——
+        静默直连是本模块最需要防的失效模式（界面显示「已配代理」，实际从本机 IP
+        出去，防封形同虚设且毫无感知）。
+        """
+        value = self.resolve_egress(auth)
+        if not value or value == "direct":
+            return await self.client()
+
+        cached = self._clients.get(value)
+        if cached is not None and not cached.is_closed:
+            return cached
+
+        from .egress import validate_proxy
+
+        try:
+            norm = validate_proxy(value)
+        except ValueError:
+            if self.cfg.upstream.egress_strict:
+                raise
+            return await self.client()
+
+        client = httpx.AsyncClient(
+            timeout=self._timeout(),
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+            proxy=norm,
+        )
+        self._clients[value] = client
+        return client
+
     async def aclose(self) -> None:
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
         self._client = None
+        for c in self._clients.values():
+            if not c.is_closed:
+                await c.aclose()
+        self._clients.clear()
 
     async def post_url(self, url: str, **kwargs: Any) -> httpx.Response:
         """对绝对 URL 发 POST（激活遥测等不在账号 base 下的端点）。
 
         复用同一连接池与测试注入点；网络故障统一转 UpstreamError(NETWORK)。
+
+        无账号上下文（激活遥测等免鉴权端点），故用默认客户端而非按账号出口路由。
         """
         client = await self.client()
         try:
@@ -171,7 +232,10 @@ class UpstreamClient:
             raise UpstreamError(ErrorKind.NETWORK, 0, str(exc)) from exc
 
     async def get_url(self, url: str, **kwargs: Any) -> httpx.Response:
-        """对绝对 URL 发 GET（同上，供 client/configs 等免鉴权端点使用）。"""
+        """对绝对 URL 发 GET（同上，供 client/configs 等免鉴权端点使用）。
+
+        同 `post_url`：无账号上下文，用默认客户端。
+        """
         client = await self.client()
         try:
             return await client.get(url, **kwargs)
@@ -219,7 +283,7 @@ class UpstreamClient:
         如 429 耗尽 / 风控 / 鉴权失效时）。账号状态本身不改 —— 回退是**请求级**
         路由决策，不能靠账号状态推导（Plan 通道 429 时账号仍是健康的）。
         """
-        client = await self.client()
+        client = await self.client_for(auth)
         if force_fallback and auth.has_fallback():
             auth = auth.as_fallback()
         base = _chat_base(self.cfg, auth)
@@ -274,7 +338,7 @@ class UpstreamClient:
         """刷新 access_token，返回 {access_token, refresh_token, expires_in, domain}。"""
         if not auth.refresh_token:
             raise UpstreamError(ErrorKind.AUTH, 0, "no refresh_token")
-        client = await self.client()
+        client = await self.client_for(auth)
         base = _chat_base(self.cfg, auth)
         hdrs = H.refresh_headers(self.cfg.upstream, auth)
         try:
@@ -315,7 +379,7 @@ class UpstreamClient:
 
     async def _fetch_v3_models(self, auth: AccountAuth, base: str) -> list[dict[str, Any]]:
         """`/v3/config` 模型面（主路）。失败返回空列表，由企业端点兜底。"""
-        client = await self.client()
+        client = await self.client_for(auth)
         hdrs = H.common_headers(self.cfg.upstream, auth)
         hdrs["Authorization"] = f"Bearer {auth.access_token}"
         try:
@@ -334,7 +398,7 @@ class UpstreamClient:
         self, auth: AccountAuth, base: str, path: str
     ) -> list[dict[str, Any]]:
         """企业模型端点（补充路）。失败返回空列表，由 v3 兜底。"""
-        client = await self.client()
+        client = await self.client_for(auth)
         hdrs = H.common_headers(self.cfg.upstream, auth)
         hdrs["Authorization"] = f"Bearer {auth.access_token}"
         try:
@@ -365,7 +429,7 @@ class UpstreamClient:
         base = (rc.models_base or rc.chat_base or "").rstrip("/") if rc else ""
         if not base:
             return []
-        client = await self.client()
+        client = await self.client_for(auth)
         try:
             resp = await client.get(base + "/v1/models", headers=H.zai_headers(auth))
         except httpx.HTTPError as exc:
@@ -387,7 +451,7 @@ class UpstreamClient:
         url = _zcode_plan_billing_url(auth)
         if not url:
             return []
-        client = await self.client()
+        client = await self.client_for(auth)
         try:
             resp = await client.get(url, headers=H.zcode_billing_headers(auth))
         except httpx.HTTPError:
@@ -412,7 +476,7 @@ class UpstreamClient:
         """
         if auth.is_zai():
             return await self._fetch_zai_credits(auth)
-        client = await self.client()
+        client = await self.client_for(auth)
         base = _billing_base(self.cfg, auth)
         hdrs = H.billing_headers(self.cfg.upstream, auth)
         paths = ([PATH_USER_RESOURCE_ALT, PATH_USER_RESOURCE]
@@ -448,7 +512,7 @@ class UpstreamClient:
         url = _zcode_plan_billing_url(auth)
         if not url:
             return {}
-        client = await self.client()
+        client = await self.client_for(auth)
         try:
             resp = await client.get(url, headers=H.zcode_billing_headers(auth))
         except httpx.HTTPError as exc:
@@ -486,7 +550,7 @@ class UpstreamClient:
         base = self._plan_billing_base(auth)
         if not base:
             raise UpstreamError(ErrorKind.BAD_REQUEST, 0, "非 Coding Plan 账号")
-        client = await self.client()
+        client = await self.client_for(auth)
         headers = H.zcode_billing_headers(auth)
         extra = kwargs.pop("headers", None)
         if isinstance(extra, dict):
@@ -568,7 +632,7 @@ class UpstreamClient:
         self, auth: AccountAuth, paths: list[str], payload: dict[str, Any],
         method: str = "POST",
     ) -> dict[str, Any]:
-        client = await self.client()
+        client = await self.client_for(auth)
         base = _billing_base(self.cfg, auth)
         hdrs = H.billing_headers(self.cfg.upstream, auth)
         last_err: UpstreamError | None = None
@@ -611,14 +675,16 @@ async def _safe_text(resp: httpx.Response) -> str:
 
 
 def _error_from(status: int, body: str, headers: dict[str, str]) -> UpstreamError:
+    """把上游失败响应翻译成 `UpstreamError`（唯一收口）。
+
+    `retry_after` 走多候选头 + 数值防呆（见 `resetat.parse_retry_after_headers`）：
+    只认纯数字，非纯数字（如 HTTP-Date）不解析；非正/超上限则尝试下一个头。
+    原始 headers 一并带上，供重置时刻的第三级解析使用。
+    """
+    from .resetat import parse_retry_after_headers
+
     kind = classify_status(status, body)
-    retry_after = 0.0
-    raw_ra = headers.get("retry-after") or headers.get("Retry-After")
-    if raw_ra:
-        try:
-            retry_after = float(raw_ra)
-        except ValueError:
-            retry_after = 0.0
+    retry_after = parse_retry_after_headers(headers)
     msg = ""
     try:
         data = json.loads(body)
@@ -626,7 +692,7 @@ def _error_from(status: int, body: str, headers: dict[str, str]) -> UpstreamErro
             msg = str(data.get("msg") or data.get("message") or "")
     except (json.JSONDecodeError, TypeError):
         msg = body[:200]
-    return UpstreamError(kind, status, msg, body, retry_after)
+    return UpstreamError(kind, status, msg, body, retry_after, dict(headers or {}))
 
 
 def _model_items(data: Any) -> list[Any]:

@@ -170,8 +170,21 @@ def response_from_openai(
     return result
 
 
-async def stream_events(chunks: Any, model: str, response_id: str) -> Any:
-    """上游 OpenAI chunk 流 → Responses 事件流（Codex CLI 消费）。"""
+async def stream_events(chunks: Any, model: str, response_id: str,
+                        repair: Any = None) -> Any:
+    """上游 OpenAI chunk 流 → Responses 事件流（Codex CLI 消费）。
+
+    `repair` 是 `keyport.upstream.markup.MarkupRepair`（可为 None）：模型把原生工具
+    调用吐成正文标记时，由它还原成 `function_call` 输出项。
+
+    这条路径是标记修复最关键的落点：Codex 只执行结构化的 `function_call` 条目，
+    标记若以纯文本落进 `output_text`，会被当普通正文写进会话历史，回合直接结束、
+    工具一次都不跑。
+
+    为此**正文改为延迟发出**：正文先进修复器缓冲，确认是普通正文才发
+    `output_text.delta`。一旦上游给出结构化 `tool_calls`，说明这轮不是标记泄漏，
+    立即把缓冲正文原样吐出并停用修复器。
+    """
     from ..upstream.sse import iter_sse_json, sse_line
 
     base_response = {
@@ -194,6 +207,33 @@ async def stream_events(chunks: Any, model: str, response_id: str) -> Any:
     finish_reason = "stop"
     usage: dict[str, Any] = {}
     tool_buffers: dict[int, dict[str, Any]] = {}
+    markup_calls: list[Any] = []
+
+    def _open_text():
+        return [
+            sse_line({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": item_id, "type": "message", "status": "in_progress",
+                         "role": "assistant", "content": []},
+            }, "response.output_item.added"),
+            sse_line({
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }, "response.content_part.added"),
+        ]
+
+    def _text_delta(text: str):
+        return sse_line({
+            "type": "response.output_text.delta",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text,
+        }, "response.output_text.delta")
 
     async for chunk in iter_sse_json(chunks):
         if chunk.get("usage"):
@@ -207,42 +247,64 @@ async def stream_events(chunks: Any, model: str, response_id: str) -> Any:
             delta = choice.get("delta")
             if not isinstance(delta, dict):
                 continue
+
+            raw_tcs = [tc for tc in (delta.get("tool_calls") or []) if isinstance(tc, dict)]
             text = delta.get("content")
-            if isinstance(text, str) and text:
+            text = text if isinstance(text, str) and text else ""
+
+            if raw_tcs:
+                if repair is not None and repair.enabled():
+                    pending = repair.flush()
+                    if pending:
+                        if not text_started:
+                            text_started = True
+                            for ev in _open_text():
+                                yield ev
+                        yield _text_delta(pending)
+                    repair = None
+                if text:
+                    if not text_started:
+                        text_started = True
+                        for ev in _open_text():
+                            yield ev
+                    yield _text_delta(text)
+                for tc in raw_tcs:
+                    tci = int(tc.get("index") or 0)
+                    slot = tool_buffers.setdefault(tci, {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        slot["id"] = str(tc["id"])
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = str(fn["name"])
+                    if isinstance(fn.get("arguments"), str):
+                        slot["arguments"] += fn["arguments"]
+                continue
+
+            if text:
+                if repair is not None and repair.enabled():
+                    emit, calls = repair.feed(text)
+                    if emit:
+                        if not text_started:
+                            text_started = True
+                            for ev in _open_text():
+                                yield ev
+                        yield _text_delta(emit)
+                    markup_calls.extend(calls)
+                    continue
                 if not text_started:
                     text_started = True
-                    yield sse_line({
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {"id": item_id, "type": "message", "status": "in_progress",
-                                 "role": "assistant", "content": []},
-                    }, "response.output_item.added")
-                    yield sse_line({
-                        "type": "response.content_part.added",
-                        "item_id": item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []},
-                    }, "response.content_part.added")
-                yield sse_line({
-                    "type": "response.output_text.delta",
-                    "item_id": item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": text,
-                }, "response.output_text.delta")
-            for tc in delta.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                tci = int(tc.get("index") or 0)
-                slot = tool_buffers.setdefault(tci, {"id": "", "name": "", "arguments": ""})
-                if tc.get("id"):
-                    slot["id"] = str(tc["id"])
-                fn = tc.get("function") or {}
-                if fn.get("name"):
-                    slot["name"] = str(fn["name"])
-                if isinstance(fn.get("arguments"), str):
-                    slot["arguments"] += fn["arguments"]
+                    for ev in _open_text():
+                        yield ev
+                yield _text_delta(text)
+
+    if repair is not None and repair.enabled():
+        tail = repair.flush()
+        if tail:
+            if not text_started:
+                text_started = True
+                for ev in _open_text():
+                    yield ev
+            yield _text_delta(tail)
 
     if text_started:
         yield sse_line({
@@ -256,10 +318,19 @@ async def stream_events(chunks: Any, model: str, response_id: str) -> Any:
     if text_started:
         output.append({"id": item_id, "type": "message", "status": "completed",
                        "role": "assistant", "content": []})
+    # 截断的工具调用直接丢弃：arguments 只剩半截 JSON 时交给 Codex 会解析失败并卡死会话
+    from ..upstream.truncation import is_truncated_arguments
+
     for slot in tool_buffers.values():
+        if is_truncated_arguments(slot["arguments"]):
+            continue
         call_id = slot["id"] or f"fc_{int(time.time() * 1000)}"
         output.append({"id": call_id, "type": "function_call", "status": "completed",
                        "call_id": call_id, "name": slot["name"], "arguments": slot["arguments"]})
+    for i, call in enumerate(markup_calls):
+        call_id = f"fc_mk_{response_id}_{i}"
+        output.append({"id": call_id, "type": "function_call", "status": "completed",
+                       "call_id": call_id, "name": call.name, "arguments": call.arguments})
 
     u = usage or {}
     status = STATUS_MAP.get(finish_reason, "completed")

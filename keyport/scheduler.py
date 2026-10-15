@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 import time
 from typing import Any
 
@@ -22,6 +24,8 @@ from .pool.manager import AccountPool
 from .upstream.base import UpstreamError
 from .upstream.client import UpstreamClient
 
+log = logging.getLogger("keyport.scheduler")
+
 TASKS = ("checkin", "travel", "activity", "keepalive", "cat")
 
 # 成长任务行为事件（上报即点亮）
@@ -29,6 +33,19 @@ GROWTH_EVENTS = (
     "open_app", "send_message", "use_tool", "view_profile",
     "daily_active", "share_content", "complete_profile", "invite_friend",
 )
+
+
+def _jitter_offset(task: str, local: time.struct_time, span_seconds: int) -> int:
+    """按 (任务, 日期, 小时) 派生确定性抖动偏移，落在 `[0, span_seconds)`。
+
+    用哈希而不是 `random`：`tick()` 每分钟重算一次，若每次得到新偏移，
+    那一小时会被反复重置、**永远到不了点**。确定性偏移保证同一小时只算一次。
+    """
+    if span_seconds <= 0:
+        return 0
+    seed = f"{task}|{local.tm_year}-{local.tm_mon}-{local.tm_mday}T{local.tm_hour}"
+    digest = hashlib.sha256(seed.encode()).digest()
+    return int.from_bytes(digest[:4], "big") % span_seconds
 
 
 class Scheduler:
@@ -48,6 +65,7 @@ class Scheduler:
         self.client = client
         self.refresher = refresher
         self._task: asyncio.Task | None = None
+        self._balance_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_run: dict[tuple[str, str], int] = {}  # (task,realm) -> hour stamp
         self.last_results: list[dict] = []
@@ -58,16 +76,20 @@ class Scheduler:
         if self._task is None or self._task.done():
             self._stop.clear()
             self._task = asyncio.create_task(self._loop())
+        if self._balance_task is None or self._balance_task.done():
+            self._balance_task = asyncio.create_task(self._balance_loop())
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-            self._task = None
+        for attr in ("_task", "_balance_task"):
+            task = getattr(self, attr)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                setattr(self, attr, None)
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
@@ -81,11 +103,18 @@ class Scheduler:
                 continue
 
     async def tick(self, now: int | None = None) -> list[dict]:
-        """检查当前整点是否命中排程；命中则执行。"""
+        """检查当前整点是否命中排程；命中则执行。
+
+        抖动（`schedule.jitter_minutes`）把触发时刻摊在该小时内的确定性偏移上：
+        **同一任务 + 同一天 + 同一小时永远同一偏移**（用哈希而非随机 —— 每轮重算
+        随机偏移会让那一小时永远不到点）。0 = 精确整点。
+        """
         now = now or int(time.time())
-        hour = time.localtime(now).tm_hour
+        local = time.localtime(now)
+        hour = local.tm_hour
         stamp = now // 3600  # 同一小时只触发一次
         sched = self.cfg.schedule
+        jitter = max(0, int(getattr(sched, "jitter_minutes", 0) or 0)) * 60
         fired: list[dict] = []
 
         mapping = {
@@ -100,26 +129,116 @@ class Scheduler:
                 continue
             if self._last_run.get(task) == stamp:
                 continue
+            if jitter:
+                offset = _jitter_offset(task, local, jitter)
+                # 该小时起点 + 偏移；未到点则等下一轮 tick（分钟级精度足够）
+                if now < stamp * 3600 + offset:
+                    continue
             self._last_run[task] = stamp
             result = await self.run_now(task)
             fired.append({"task": task, "hour": hour, "result": result})
         return fired
 
+    # ---- 余额后台刷新 ----
+
+    async def _balance_loop(self) -> None:
+        """分钟级周期刷新余额（独立于整点排程）。
+
+        余额是**分钟级观测量**，但只在签到/请求时才更新 —— 积分冷却（余额耗尽）的
+        账号要等到下一个签到点（最坏约 11.5 小时）才可能解冻。独立周期刷新让
+        「余额恢复 → 自动解冻」在几分钟内生效，也是面板额度展示的新鲜度保障。
+
+        刻意**不做签到、不刷 token** —— 只让「积分」这个观测量保持新鲜。
+        """
+        while not self._stop.is_set():
+            minutes = max(1, int(self.cfg.schedule.balance_refresh_minutes or 5))
+            try:
+                if self.cfg.schedule.balance_refresh_enabled:
+                    await self.refresh_balances()
+            except Exception as exc:  # noqa: BLE001 - 后台循环不允许被单次失败打断
+                log.warning("余额后台刷新失败：%s", exc)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=minutes * 60)
+            except asyncio.TimeoutError:  # noqa: UP041 - 与既有 tick 循环同一写法
+                continue
+
+    async def refresh_balances(self) -> dict:
+        """刷新全部账号余额；余额恢复的冷却账号自动解冻。"""
+        include_disabled = self.cfg.schedule.include_disabled_in_tasks
+        entries = [
+            e for e in self.pool.all_entries()
+            if e.kind != "apikey" and (include_disabled or e.in_pool())
+        ]
+        ok = failed = 0
+        for entry in entries:
+            try:
+                auth = await self.refresher.ensure_valid(self.pool.auth_for(entry))
+            except UpstreamError:
+                failed += 1
+                continue
+            if not auth.access_token:
+                failed += 1
+                continue
+            try:
+                data = await self.client.fetch_credits(auth)
+            except UpstreamError:
+                failed += 1
+                continue
+            self.pool.update_credits(
+                entry.uid, int(data.get("credits") or 0),
+                expiring=int(data.get("expiring") or 0),
+                used=data.get("used"),
+            )
+            ok += 1
+        self.pool.save_state()
+        return {"ok": ok, "failed": failed, "total": len(entries)}
+
     # ---- 任务执行 ----
 
     async def run_now(self, task: str, realm: str = "") -> list[dict]:
-        """立即执行某任务（全账号或指定域）。"""
+        """立即执行某任务（全账号或指定域）。
+
+        门控（方向**逐任务不同**，不能一刀切）：
+
+        - **企业版**：无个人成长体系，成长类端点上游直接 403
+          （`growth system is only available for personal users`）——
+          执行任何成长任务都是零收益白跑，且这类「静默无效」在日志里看不出异常。
+        - **global（国际版）**：无 CN 任务体系 → 签到 / 旅行 / 夜猫跳过；
+          但**活跃上报不跳过**（实测可用），跳过会让国际版连登永远点不亮。
+        """
+        include_disabled = self.cfg.schedule.include_disabled_in_tasks
         entries = [
             e for e in self.pool.all_entries()
-            if e.kind != "apikey" and (not realm or e.realm == realm)
+            if e.kind != "apikey"
+            and (not realm or e.realm == realm)
+            and (include_disabled or e.in_pool())
         ]
         results: list[dict] = []
         for entry in entries:
-            outcome = await self._run_for(task, entry)
+            skip = self._gate_reason(task, entry)
+            if skip:
+                outcome = {"uid": entry.uid, "realm": entry.realm, "ok": True,
+                           "skipped": True, "detail": skip}
+            else:
+                outcome = await self._run_for(task, entry)
             results.append(outcome)
             self._record(task, entry, outcome)
         self.last_results = results
         return results
+
+    def _gate_reason(self, task: str, entry: Any) -> str:
+        """该账号是否应跳过此任务；返回原因（空串 = 照常执行）。"""
+        # 活跃上报对 global 可用（实测 workbuddy.ai 的 /v2/report 返回 code=0），
+        # 跳过会让国际版连登永远点不亮 —— 这里刻意不按 realm 跳过。
+        if task == "activity":
+            if getattr(entry, "is_enterprise", False):
+                return "企业版无个人成长体系（上游 403），跳过"
+            return ""
+        if getattr(entry, "realm", "") == "global":
+            return "国际版无国内任务体系，跳过"
+        if getattr(entry, "is_enterprise", False):
+            return "企业版无个人成长体系（上游 403），跳过"
+        return ""
 
     async def _run_for(self, task: str, entry) -> dict:
         try:
@@ -201,10 +320,16 @@ class Scheduler:
                 "detail": f"events={lit} claimed={claimed}"}
 
     def _record(self, task: str, entry, outcome: dict) -> None:
+        # 跳过（门控）与失败必须分开：跳过是**预期**的正常态（global / 企业版 /
+        # 无凭证），算成失败会让台账天天报「全灭」并触发毫无意义的当日重试。
+        if outcome.get("skipped"):
+            detail = f"skipped: {outcome.get('detail', '')}"
+        else:
+            detail = str(outcome.get("detail", ""))
         self.db.execute(
             "INSERT INTO task_runs(ts, task, realm, account, ok, detail) VALUES(?,?,?,?,?,?)",
             (db_now(), task, entry.realm, entry.uid,
-             1 if outcome.get("ok") else 0, str(outcome.get("detail", ""))[:300]),
+             1 if outcome.get("ok") else 0, detail[:300]),
         )
 
     # ---- 状态 ----
@@ -224,6 +349,10 @@ class Scheduler:
                 "activity_enabled": sched.activity_enabled,
                 "keepalive_enabled": sched.keepalive_enabled,
                 "cat_enabled": sched.cat_enabled,
+                "balance_refresh_enabled": sched.balance_refresh_enabled,
+                "balance_refresh_minutes": sched.balance_refresh_minutes,
+                "include_disabled_in_tasks": sched.include_disabled_in_tasks,
+                "jitter_minutes": sched.jitter_minutes,
             },
             "last_results": self.last_results[-20:],
         }

@@ -28,7 +28,7 @@ from .guards import (
     limits_for,
 )
 from .ledger import ModelLedger
-from .selector import available_uids, select
+from .selector import available_uids, preview_candidates, select
 from .sticky import StickyStore
 from .transitions import (
     apply_error,
@@ -104,6 +104,10 @@ class AccountPool:
                     refresh_token=row["refresh_token"] or "",
                     fingerprint=_load_fingerprint(row["fingerprint"]),
                     installed_at=int(row["installed_at"] or 0),
+                    egress_proxy=row["egress_proxy"] or "",
+                    egress_checked_at=int(row["egress_checked_at"] or 0),
+                    egress_ip=row["egress_ip"] or "",
+                    egress_error=row["egress_error"] or "",
                 )
                 self._entries[entry.uid] = entry
 
@@ -180,6 +184,75 @@ class AccountPool:
 
     def available_uids(self, realm: str = "", model: str = "") -> list[str]:
         return available_uids(self.all_entries(), self.cfg.pool, realm=realm, model=model)
+
+    # ---- 选号可观测 ----
+
+    def preview_candidates(self, *, realm: str = "", model: str = "",
+                           tried: set[str] | None = None,
+                           now: int | None = None) -> list[dict]:
+        """候选队列预览（**只读**，不写任何状态）。"""
+        return preview_candidates(
+            self.all_entries(), self.cfg.pool, realm=realm, model=model,
+            tried=tried or set(), last_pick=self._last_pick, now=now,
+            guard=lambda e: self.guard_reason(e, model=model),
+        )
+
+    def selection_balance(self, hours: int = 24) -> dict:
+        """选号均衡度：偏斜倍数与覆盖率。
+
+        选号退化成「额度排序」（少数号吃掉大半流量）是防封上的实质危险，
+        且此前只能事后从日报发现。
+
+        告警判据是「绝对占比 ≥ 阈值 **且** 相对偏斜 ≥ 阈值」两条件取与 ——
+        单看绝对阈值在池里只有 4 个号时必然误报（完全均匀也每个 25%），
+        运维第一天就学会忽略它。
+        """
+        hours = max(1, min(int(hours) if hours else 24, 24 * 30))
+        since = db_now() - hours * 3600
+        rows = self.db.query(
+            "SELECT account_uid, COUNT(*) AS n FROM request_logs "
+            "WHERE ts >= ? AND account_uid <> '' GROUP BY account_uid "
+            "ORDER BY n DESC",
+            (since,),
+        )
+        counts = {str(r["account_uid"]): int(r["n"]) for r in rows}
+        total = sum(counts.values())
+
+        total_accounts = len(self.all_entries())
+        used = len(counts)
+        # 理想占比按「本可以轮到的账号数」算 —— 未用到的号要计入分母
+        denom = max(1, max(used, total_accounts))
+        ideal = 100.0 / denom
+
+        max_share = (max(counts.values()) / total * 100.0) if total else 0.0
+        skew = (max_share / ideal) if ideal > 0 else 0.0
+        coverage = (used / total_accounts * 100.0) if total_accounts else 0.0
+
+        warn_share = 15.0
+        warn_ratio = 2.0
+        if total and max_share >= warn_share and skew >= warn_ratio:
+            verdict = "skewed"
+        elif total_accounts and coverage < 50.0:
+            verdict = "low-coverage"
+        else:
+            verdict = "ok"
+
+        return {
+            "hours": hours,
+            "calls": total,
+            "accounts_total": total_accounts,
+            "accounts_used": used,
+            "coverage_pct": round(coverage, 2),
+            "ideal_share_pct": round(ideal, 2),
+            "max_share_pct": round(max_share, 2),
+            "skew_ratio": round(skew, 2),
+            "verdict": verdict,
+            "top": [
+                {"uid": uid, "calls": n,
+                 "share_pct": round(n / total * 100.0, 2) if total else 0.0}
+                for uid, n in list(counts.items())[:10]
+            ],
+        }
 
     # ---- 选号 + 租约 ----
 
@@ -476,6 +549,40 @@ class AccountPool:
                  1 if entry.enabled else 0, entry.disabled_reason, db_now(), uid),
             )
 
+    # ---- 出站代理（出口线路）----
+
+    def set_egress(self, uid: str, value: str) -> bool:
+        """设置账号级出站代理；返回账号是否存在。
+
+        `value` 已经过 `validate_account_egress` 校验（调用方负责），
+        `''` = 未指定（跟随全局默认）、`'direct'` = 显式直连、其余为代理 URL。
+        """
+        with self._lock:
+            entry = self._entries.get(uid)
+            if entry is None:
+                return False
+            entry.egress_proxy = value or ""
+            self.db.execute(
+                "UPDATE accounts SET egress_proxy=?, updated_at=? WHERE uid=?",
+                (entry.egress_proxy, db_now(), uid),
+            )
+            return True
+
+    def record_egress_probe(self, uid: str, *, ip: str = "", error: str = "") -> None:
+        """记录一次出口探活结果（诊断用，不参与选号判定）。"""
+        with self._lock:
+            entry = self._entries.get(uid)
+            if entry is None:
+                return
+            entry.egress_checked_at = int(time.time())
+            entry.egress_ip = ip or ""
+            entry.egress_error = error or ""
+            self.db.execute(
+                "UPDATE accounts SET egress_checked_at=?, egress_ip=?, egress_error=?, "
+                "updated_at=? WHERE uid=?",
+                (entry.egress_checked_at, entry.egress_ip, entry.egress_error, db_now(), uid),
+            )
+
     def mark_checkin(self, uid: str) -> None:
         with self._lock:
             entry = self._entries.get(uid)
@@ -550,6 +657,7 @@ class AccountPool:
                     file_path=auth.file_path, kind=auth.kind,
                     token_expires_at=auth.expires_at, refresh_token=auth.refresh_token,
                     fingerprint=fingerprint,
+                    egress_proxy=getattr(auth, "egress_proxy", "") or "",
                 )
                 self._entries[auth.uid] = entry
             else:
@@ -562,6 +670,10 @@ class AccountPool:
                 entry.token_expires_at = auth.expires_at
                 entry.refresh_token = auth.refresh_token
                 entry.fingerprint = fingerprint
+                # 出口配置以 DB 为准：auth 对象可能来自 auths/ 文件扫描（无该字段），
+                # 覆盖成空会把管理员在面板里配的线路抹掉
+                if auth.egress_proxy:
+                    entry.egress_proxy = auth.egress_proxy
             # 回填到传入对象，供调用方立即使用同一份档案（出站头同源）
             auth.fingerprint = fingerprint
             return entry

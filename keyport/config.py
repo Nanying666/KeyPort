@@ -44,6 +44,17 @@ class UpstreamConfig:
     device_token_file: str = ""
     passthrough_ip: bool = False
 
+    # ---- 出站代理（出口线路）----
+    # 全局默认出口：空 = 直连。账号级 `egress_proxy` 优先于它；
+    # 账号填 `direct` 可显式覆盖全局默认，单独走直连。
+    #
+    # 为什么要有账号级：N 个账号都从同一个出口 IP 出去，在上游眼里就是
+    # 「一个 IP 挂了 N 个号」的强关联信号。按账号分散出口是防封的主要手段。
+    egress_proxy_default: str = ""
+    # 代理 URL 填错一个字符会让账号**静默回落直连**（界面仍显示「已配代理」，
+    # 防封形同虚设）。开启后校验不过即判该账号出口失败并记明确原因，不回落。
+    egress_strict: bool = True
+
 
 @dataclass
 class CaptchaConfig:
@@ -181,6 +192,25 @@ class ScheduleConfig:
     keepalive_enabled: bool = True
     cat_enabled: bool = True
 
+    # ---- 余额后台刷新（分钟级，独立于整点排程）----
+    # 余额是分钟级观测量；不周期刷新的话，积分冷却（余额耗尽）的账号要等到下一个
+    # 签到点（最坏约 11.5 小时）才可能解冻。<=0 时回落 5 分钟。
+    balance_refresh_enabled: bool = True
+    balance_refresh_minutes: int = 5
+
+    # ---- 保号类任务是否覆盖已禁用账号 ----
+    # 「禁用」只关选号、不停保号：轮换用法下这是把闲置号保持可用的关键
+    # （否则禁用号 token 过期后再也救不回来）。开启后禁用号照常签到保活，
+    # 但**仍不参与选号**。
+    include_disabled_in_tasks: bool = True
+
+    # ---- 排程抖动 ----
+    # 多账号同点触发会在整点打出尖峰，容易触发上游风控。把触发时刻摊在
+    # `[0, jitter_minutes)` 内，且**同一任务 + 同一天 + 同一小时偏移恒定**
+    # （用哈希而非随机 —— 每轮重算随机偏移会让那一小时永远不到点）。
+    # 0 = 精确整点（保留旧行为）。
+    jitter_minutes: int = 0
+
 
 @dataclass
 class GuardConfig:
@@ -243,6 +273,15 @@ class FeaturesConfig:
     sanitize_blacklist_fingerprints: bool = True
     compress_long_context: bool = True
     reasoning_injection: bool = True
+    # 还原模型原生工具调用标记（DSML）：上游只在请求声明了 tools 时才把标记解析成
+    # 结构化 tool_calls；tools 在中转环节丢失时标记会以纯文本落进 content，下游
+    # （尤其 Codex）把它当普通正文写进历史，回合直接结束、工具一次都不跑。
+    # 关闭后行为与修复前一致（标记原样透出）。
+    repair_native_tool_markup: bool = True
+    # 注入上游前缀缓存键 `prompt_cache_key`：实测同一段 8k token 前缀
+    # 不带 → credit≈0.34，带 → credit≈0.02（费用降约 17×）。
+    # 键按账号隔离（uid 参与哈希），跨账号绝不碰撞。
+    inject_prompt_cache_key: bool = True
 
 
 @dataclass

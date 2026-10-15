@@ -65,6 +65,20 @@ class AccountEntry:
     # 安装序完成时间（0 = 未完成；幂等门）
     installed_at: int = 0
 
+    # 账号级出站代理（出口线路）：'' = 未指定（跟随全局默认），'direct' = 显式直连，
+    # 其余为代理 URL。N 个账号共用同一出口 IP 会在上游聚成「一个 IP 挂 N 个号」的
+    # 强关联信号，按账号分散出口是防封的主要手段。
+    egress_proxy: str = ""
+    # 最近一次出口探活结果（诊断用）
+    egress_checked_at: int = 0
+    egress_ip: str = ""
+    egress_error: str = ""
+
+    @property
+    def is_enterprise(self) -> bool:
+        """企业版账号（无个人成长体系）。上游打成长端点直接 403，属零收益白跑。"""
+        return bool(self.enterprise_id)
+
     # 账号级限额护栏的当日计数（None = 未知 / 护栏关闭 → 一律放行）
     daily_tokens_today: int | None = None
     daily_credits_today: float | None = None

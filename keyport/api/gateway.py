@@ -117,6 +117,23 @@ class ChatSession:
         self._origin_body: dict[str, Any] = dict(params.body)
         # Anthropic 原生上游：下游协议不是 anthropic 时需要把上游事件转回 OpenAI chunk
         self.anthropic_upstream = False
+        # 模型原生工具调用标记（DSML）修复器：三条流式协议共用同一个实例
+        # （同一条响应流），非流式路径另走 repair_aggregated_response。
+        self.markup_repair = self._build_markup_repair()
+
+    def _build_markup_repair(self):
+        """按客户端声明的工具名单构造标记修复器。
+
+        名单为空也启用（`allow_unknown=True`）：实测最常见的泄漏场景恰恰是 `tools`
+        声明在中转环节丢失，此时请求体里根本没有名单，弱判定是唯一的兜底。
+        """
+        cfg = self.gateway.cfg
+        if not getattr(cfg.features, "repair_native_tool_markup", True):
+            return None
+        from ..upstream.markup import MarkupRepair, tool_name_allowlist
+
+        allowed = tool_name_allowlist(self._origin_body)
+        return MarkupRepair(allowed=allowed, allow_unknown=True)
 
     # ---- 建立 ----
 
@@ -285,7 +302,9 @@ class ChatSession:
             while True:
                 current = auth.as_fallback() if (use_fallback and auth.has_fallback()) else auth
                 self.anthropic_upstream = current.is_anthropic()
-                body_bytes = self._rewrite_body(prompt_text, entry.realm, compress_max)
+                body_bytes = self._rewrite_body(
+                    prompt_text, entry.realm, compress_max, entry.uid
+                )
                 meta = ChatMeta(
                     conversation_id=self.params.conversation_id,
                     client_ip=self.params.client_ip,
@@ -454,13 +473,24 @@ class ChatSession:
             pass
 
     def _rewrite_body(self, prompt_text: str, account_realm: str,
-                      compress_max: int) -> bytes:
+                      compress_max: int, account_uid: str = "") -> bytes:
         """按实际账号域改写请求体（每次换号都重新改写，域随账号变化）。
 
         从原始入站快照出发，避免在已改写结果上二次改写（换号重试时）。
+
+        `account_uid` 参与上游前缀缓存键的构造：**按账号隔离是硬要求** ——
+        跨账号复用同一 cache key 会让上游命中错账号的前缀缓存、泄露对方对话。
         """
         cfg = self.gateway.cfg
         self.params.body = dict(self._origin_body)
+        # 上游前缀缓存键：实测同一段 8k 前缀可把费用降约 17×。
+        # 客户端已带该字段时 inject 会原值保留（它更清楚该复用哪个键）。
+        if cfg.features.inject_prompt_cache_key:
+            from ..upstream.cache_key import inject_prompt_cache_key
+
+            inject_prompt_cache_key(
+                self.params.body, account_uid, self.params.conversation_id
+            )
         if self.anthropic_upstream:
             return self._build_anthropic_body(prompt_text)
         return prepare_body(
@@ -686,11 +716,76 @@ def extract_credits(usage: dict[str, Any] | None) -> float:
 async def openai_stream(session: ChatSession) -> AsyncIterator[bytes]:
     """透传上游 OpenAI SSE，收尾时回写统计（usage 由 iter_lines 统一捕获）。
 
-    下游拿到的是原样的 OpenAI chunk 流（含 `data: [DONE]`）。
+    下游拿到的是 OpenAI chunk 流（含 `data: [DONE]`）。
+
+    有标记修复器时不能逐字节原样透传 —— 需要在 chunk 级别把 `delta.content` 里
+    的标记还原成 `delta.tool_calls`。此时重编码受影响的行，其余行原样透出。
     """
+    from ..upstream.markup import to_delta_tool_calls
+
+    repair = session.markup_repair
+    seq = 0
     try:
         async for line in session.iter_lines():
-            yield (line.strip("\r\n") + "\n\n").encode("utf-8")
+            stripped = line.strip("\r\n")
+            if not repair or not repair.enabled() or not stripped.startswith("data:"):
+                yield (stripped + "\n\n").encode()
+                continue
+            payload = stripped[5:].strip()
+            if not payload or payload == "[DONE]":
+                yield (stripped + "\n\n").encode()
+                continue
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                yield (stripped + "\n\n").encode()
+                continue
+            if not isinstance(chunk, dict):
+                yield (stripped + "\n\n").encode()
+                continue
+
+            changed = False
+            for choice in chunk.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                raw_tcs = [tc for tc in (delta.get("tool_calls") or [])
+                           if isinstance(tc, dict)]
+                text = delta.get("content")
+                if raw_tcs:
+                    # 上游给出结构化调用 → 不是泄漏；把缓冲正文原样补回并停用
+                    pending = repair.flush()
+                    if pending:
+                        delta["content"] = pending + (text if isinstance(text, str) else "")
+                    repair = None
+                    session.markup_repair = None
+                    changed = True
+                    continue
+                if not isinstance(text, str) or not text:
+                    continue
+                emit, calls = repair.feed(text)
+                if calls:
+                    delta["content"] = emit
+                    delta["tool_calls"] = to_delta_tool_calls(calls, base=seq)
+                    seq += len(calls)
+                    changed = True
+                elif emit != text:
+                    delta["content"] = emit
+                    changed = True
+
+            if changed:
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+            else:
+                yield (stripped + "\n\n").encode()
+
+        # 流尾：修复器可能还握着未判定的尾巴，原样补发一帧
+        if repair and repair.enabled():
+            tail = repair.flush()
+            if tail:
+                frame = {"choices": [{"index": 0, "delta": {"content": tail}}]}
+                yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n".encode()
     finally:
         # usage / TTFB 已在 iter_lines 内捕获，这里只做收尾落库
         session.finish(None)
@@ -735,6 +830,39 @@ async def openai_collect(session: ChatSession) -> tuple[dict[str, Any], dict[str
         }],
         "usage": usage,
     }
+    # 模型把原生工具调用吐成正文标记时，在这里还原成结构化 tool_calls
+    # （仅当该 choice 没有真实 tool_calls 且 finish_reason == stop）。
+    # 注意：必须由 session 的修复器是否存在来决定是否启用，否则 feature 开关失效。
+    if session.markup_repair is not None:
+        from ..upstream.markup import repair_aggregated_response
+
+        repair_aggregated_response(
+            body,
+            allowed=session.markup_repair.allowed,
+            allow_unknown=True,
+        )
+
+    # 截断的工具调用：arguments 只剩半截 JSON 时**丢弃**，不要交给客户端
+    # （客户端解析会报非法 JSON 并卡死会话）。补成 `{}` 更糟 —— 那是伪造「参数合法」
+    # 的外观，客户端会拿空参数去执行。
+    from ..upstream.truncation import drop_truncated_tool_calls
+
+    for choice in body.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message")
+        if not isinstance(msg, dict):
+            continue
+        kept, dropped = drop_truncated_tool_calls(msg.get("tool_calls"))
+        if dropped:
+            if kept:
+                msg["tool_calls"] = kept
+            else:
+                msg.pop("tool_calls", None)
+                # 整条只剩残缺调用 → 该回合没有可用输出，如实标记
+                if not msg.get("content"):
+                    choice["finish_reason"] = "length"
+
     if agg.truncated and not session.error:
         session.error = f"truncated:{agg.truncation_reason}"
     session.finish(usage, extract_credits(usage))

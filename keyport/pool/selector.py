@@ -145,3 +145,113 @@ def available_uids(
         and e.healthy_for_model(now, model)
         and e.has_capacity(cfg)
     ]
+
+
+def _skip_reason(entry: AccountEntry, cfg: PoolConfig, now: int, model: str,
+                 realm: str, tried: set[str], guard_reason: str) -> str:
+    """账号为什么进不了候选；返回机器可读短码（空串 = 可进候选）。"""
+    if realm and entry.realm != realm:
+        return "realm"
+    if entry.uid in tried:
+        return "tried"
+    if not entry.enabled:
+        return "disabled"
+    if entry.manual_disabled:
+        return "manual_disabled"
+    if entry.model_cooldowns.get(model, 0) > now if model else False:
+        return "model_cooling"
+    if entry.cooldown_until > now:
+        return "cooling"
+    if entry.breaker_until > now:
+        return "breaker"
+    if entry.degraded_until > now:
+        return "degraded"
+    if guard_reason:
+        return "guard"
+    if not entry.has_capacity(cfg):
+        return "in_flight_full"
+    return ""
+
+
+_SKIP_TEXT = {
+    "realm": "不属于目标域",
+    "tried": "本次请求已试过",
+    "disabled": "系统已禁用",
+    "manual_disabled": "运维手动摘除",
+    "model_cooling": "该模型处于限流冷却",
+    "cooling": "账号冷却中",
+    "breaker": "熔断中",
+    "degraded": "连败降权中",
+    "guard": "被账号级限额护栏挡住",
+    "in_flight_full": "在途请求已满",
+}
+
+
+def preview_candidates(
+    entries: list[AccountEntry],
+    cfg: PoolConfig,
+    *,
+    now: int | None = None,
+    realm: str = "",
+    model: str = "",
+    tried: set[str] | None = None,
+    last_pick: dict[str, float] | None = None,
+    guard: Callable[[AccountEntry], str] | None = None,
+) -> list[dict]:
+    """候选队列预览：**只读**，复现「如果现在发一个请求，会怎么排」。
+
+    关键契约是**不写任何状态** —— 不动 `last_pick`、不写探索 timer、不改账号
+    状态位。因此它回答的是"现在会怎么排"，而不是"上次是怎么排的"。
+
+    排障时最常见的问题不是"选号坏了"，而是"为什么总选它 / 为什么跳过它"。
+    输出按「进候选者按排名、落选者按原因再按 uid」排序，稳定可复现。
+    """
+    now = now or int(time.time())
+    tried = tried or set()
+    last_pick = last_pick if last_pick is not None else {}
+
+    rows: list[dict] = []
+    pool: list[AccountEntry] = []
+    for entry in entries:
+        reason = ""
+        if guard is not None:
+            try:
+                reason = guard(entry) or ""
+            except Exception:  # noqa: BLE001 - 护栏异常不该阻断预览
+                reason = ""
+        skip = _skip_reason(entry, cfg, now, model, realm, tried, reason)
+        row = {
+            "uid": entry.uid,
+            "realm": entry.realm,
+            "nickname": entry.nickname,
+            "credits": entry.credits,
+            "skip": skip,
+            "skip_text": _SKIP_TEXT.get(skip, "") if skip else "",
+            "in_flight": entry.inflight,
+            "cool_until": max(entry.cooldown_until, entry.breaker_until,
+                              entry.degraded_until),
+            "model_cooldown_until": entry.model_cooldowns.get(model, 0) if model else 0,
+            "recent_pick": float(last_pick.get(entry.uid, 0.0)),
+        }
+        if not skip:
+            pool.append(entry)
+        rows.append(row)
+
+    if pool:
+        max_credits = max((e.credits for e in pool), default=0)
+        weights = {e.uid: compute_weight(e, max_credits, now, cfg) for e in pool}
+        ordered = sorted(pool, key=lambda e: weights[e.uid], reverse=True)
+        top_k = max(1, cfg.top_k)
+        for rank, entry in enumerate(ordered):
+            row = next(r for r in rows if r["uid"] == entry.uid)
+            row["weight"] = round(weights[entry.uid], 4)
+            row["rank"] = rank + 1
+            row["in_top"] = rank < top_k
+            # 防惊群窗口：与 select() 的判定保持同一口径
+            gap = max(0, cfg.pick_gap_ms) / 1000.0
+            row["in_gap"] = bool(
+                gap > 0 and (now - float(last_pick.get(entry.uid, 0.0))) < gap
+            )
+
+    rows.sort(key=lambda r: (r["skip"] != "", r.get("rank", 9999), r["uid"]))
+    return rows

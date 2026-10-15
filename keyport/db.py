@@ -48,7 +48,6 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at         INTEGER NOT NULL DEFAULT 0,
     updated_at         INTEGER NOT NULL DEFAULT 0
 );
-
 CREATE TABLE IF NOT EXISTS api_keys (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL DEFAULT '',
@@ -163,6 +162,12 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("accounts", "fallback_base_url", "TEXT NOT NULL DEFAULT ''"),
     ("accounts", "fingerprint", "TEXT NOT NULL DEFAULT '{}'"),
     ("accounts", "installed_at", "INTEGER NOT NULL DEFAULT 0"),
+    # 账号级出站代理：'' = 未指定（跟随全局默认），'direct' = 显式直连，
+    # 其余为代理 URL（http/https/socks5）
+    ("accounts", "egress_proxy", "TEXT NOT NULL DEFAULT ''"),
+    ("accounts", "egress_checked_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("accounts", "egress_ip", "TEXT NOT NULL DEFAULT ''"),
+    ("accounts", "egress_error", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
