@@ -357,9 +357,7 @@ class Scheduler:
             if task == "checkin":
                 return await self._checkin(entry, auth)
             if task == "travel":
-                data = await self.client.travel(auth)
-                return {"uid": entry.uid, "realm": entry.realm,
-                        "ok": bool(data.get("ok")), "detail": data.get("msg", "")}
+                return await self._buddy_travel(entry, auth, "猫猫")
             if task == "activity":
                 return await self._activity(entry, auth)
             if task == "keepalive":
@@ -369,10 +367,9 @@ class Scheduler:
             if task == "web_active":
                 return await self._web_active(entry, auth)
             if task == "cat":
-                # 夜猫任务复用旅行端点（独立排程，互不影响）
-                data = await self.client.travel(auth)
-                return {"uid": entry.uid, "realm": entry.realm,
-                        "ok": bool(data.get("ok")), "detail": "night-cat"}
+                # 夜猫任务复用 Buddy 旅行链路（独立排程，互不影响）：
+                # 夜里这一班负责把白天派出、当晚到达的奖励补领掉。
+                return await self._buddy_travel(entry, auth, "夜猫")
         except UpstreamError as exc:
             return {"uid": entry.uid, "realm": entry.realm, "ok": False,
                     "detail": f"{exc.kind.value}: {exc.message}"}
@@ -459,6 +456,65 @@ class Scheduler:
             pass
 
         return (" + " + " ".join(notes)) if notes else ""
+
+    async def _buddy_travel(self, entry, auth, label: str = "旅行") -> dict:
+        """Buddy 旅行（原「猫猫旅行」）：按当前状态推进四步状态机。
+
+        旧的 `POST /v2/billing/activity/travel` 已下线（恒 404），旅行改版为
+        「Buddy 旅行」。状态机（`_gate_reason` 之外无其它前置）：
+
+            idle      → depart（当日首次派出；重复派发会被上游拒）
+            traveling → 等下一班（到达后由下一次排程领奖）
+            arrived   → claim（领奖，`reward_credit` 入账）
+
+        每个自然日只能**派出一次**，故本任务天然幂等：重复触发只会补领未领的
+        奖励，不会重复派出。白天 09:00 派出、晚上 21:00 到达领奖即为正常节奏。
+        """
+        def out(ok: bool, detail: str) -> dict:
+            return {"uid": entry.uid, "realm": entry.realm, "ok": ok, "detail": detail}
+
+        try:
+            state = await self.client.buddy_travel_status(auth)
+        except UpstreamError as exc:
+            return out(False, f"{exc.kind.value}: {exc.message}")
+
+        cur = str(state.get("state") or "")
+        reached = bool(state.get("daily_limit_reached"))
+
+        if cur == "arrived":
+            try:
+                data = await self.client.buddy_travel_claim(auth)
+            except UpstreamError as exc:
+                # 「not arrived yet」是状态竞态（另一端刚领过），非故障
+                if "not arrived" in (exc.message or "").lower():
+                    return out(True, "尚未到达（状态竞态），下次再领")
+                return out(False, f"{exc.kind.value}: {exc.message}")
+            credit = data.get("reward_credit") or 0
+            return out(True, f"{label}领奖+{credit}分")
+
+        if cur == "idle" and not reached:
+            try:
+                config = await self.client.buddy_travel_config(auth)
+            except UpstreamError as exc:
+                return out(False, f"{exc.kind.value}: {exc.message}")
+            locations = config.get("locations") if isinstance(config, dict) else None
+            loc = next((x for x in (locations or [])
+                        if isinstance(x, dict) and x.get("id") is not None), None)
+            if loc is None:
+                return out(False, "无可用旅行地点")
+            try:
+                await self.client.buddy_travel_depart(auth, loc["id"])
+            except UpstreamError as exc:
+                if "already traveling" in (exc.message or "").lower():
+                    return out(True, f"{label}已在旅行中")
+                return out(False, f"{exc.kind.value}: {exc.message}")
+            return out(True, f"{label}出发→{loc.get('name') or loc.get('code')}")
+
+        if cur == "traveling":
+            return out(True, f"{label}旅行中，等待到达")
+        if reached:
+            return out(True, f"{label}今日已派出（额度已用）")
+        return out(True, f"{label}state={cur or 'unknown'}")
 
     async def _web_active(self, entry, auth) -> dict:
         """国际版每日活跃打卡：跑完一次网页端云 agent 会话。
