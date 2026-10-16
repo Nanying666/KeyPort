@@ -48,6 +48,24 @@ MAKEUP_CARD_USE_PATH = "/activity/growth/makeup-cards/use"
 CLAIM_GIFT_PATH = "/billing/meter/claim-gift"
 CLAIM_COMPENSATION_PATH = "/billing/meter/claim-compensation"
 
+# ---- Buddy 旅行（原「猫猫旅行」改版后的链路）----
+#
+# 旧的 `POST /v2/billing/activity/travel` 已下线（恒 404）。旅行改版为
+# 「Buddy 旅行」，四步状态机（照官方前端 / 参考实现实测口径）：
+#
+#     状态 : GET  {base}/activity/growth/buddy/travel/status
+#     地点 : GET  {base}/v2/activity/growth/buddy/travel/config
+#     出发 : POST {base}/v2/activity/growth/buddy/travel/depart   body {"location_id":<id>}
+#     领奖 : POST {base}/activity/growth/buddy/travel/claim        ← **无 /v2、无 body**
+#
+# `state` 取 `idle`（未出发）/ `traveling`（在路上）/ `arrived`（可领奖）。
+# 每个自然日只能**派出一次**；派出会立即置 `daily_limit_reached=true`。
+# 一天的正确节奏：早上 `idle → depart`，后续排程点 `arrived → claim`。
+BUDDY_TRAVEL_STATUS_PATH = "/activity/growth/buddy/travel/status"
+BUDDY_TRAVEL_CONFIG_PATH = "/v2/activity/growth/buddy/travel/config"
+BUDDY_TRAVEL_DEPART_PATH = "/v2/activity/growth/buddy/travel/depart"
+BUDDY_TRAVEL_CLAIM_PATH = "/activity/growth/buddy/travel/claim"
+
 # CST（Asia/Shanghai）：上游自然日口径，固定 +8，不依赖容器 tzdata
 CST_OFFSET_SECONDS = 8 * 3600
 
@@ -517,3 +535,38 @@ async def claim_compensation(client: Any, auth: AccountAuth) -> int:
     if not isinstance(data, dict):
         return 0
     return int(data.get("credit") or 0)
+
+
+# ---- Buddy 旅行原语 ----
+
+
+async def buddy_travel_status(client: Any, auth: AccountAuth) -> dict[str, Any]:
+    """Buddy 旅行当前状态（`state` / `daily_limit_reached` / `reward_credit`）。
+
+    `state`：`idle` 未出发 / `traveling` 在路上 / `arrived` 已到达可领奖。
+    """
+    data = await _growth_json(client, auth, "GET", BUDDY_TRAVEL_STATUS_PATH)
+    return data if isinstance(data, dict) else {}
+
+
+async def buddy_travel_config(client: Any, auth: AccountAuth) -> dict[str, Any]:
+    """可选旅行地点列表（含 id 与时长范围）。"""
+    data = await _growth_json(client, auth, "GET", BUDDY_TRAVEL_CONFIG_PATH)
+    return data if isinstance(data, dict) else {}
+
+
+async def buddy_travel_depart(client: Any, auth: AccountAuth,
+                              location_id: Any) -> dict[str, Any]:
+    """派 Buddy 出发去某地点（每自然日一次，重复派发会被上游拒）。"""
+    data = await _growth_json(client, auth, "POST", BUDDY_TRAVEL_DEPART_PATH,
+                              {"location_id": location_id})
+    return data if isinstance(data, dict) else {}
+
+
+async def buddy_travel_claim(client: Any, auth: AccountAuth) -> dict[str, Any]:
+    """领取 Buddy 旅行奖励（仅在 `state == arrived` 时有效）。
+
+    **路径无 `/v2`、无 body** —— 与 growth 领奖同一口径。
+    """
+    data = await _growth_json(client, auth, "POST", BUDDY_TRAVEL_CLAIM_PATH, {})
+    return data if isinstance(data, dict) else {}

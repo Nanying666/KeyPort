@@ -736,6 +736,32 @@ class UpstreamClient:
 
         return await growth.claim_compensation(self, auth)
 
+    # ---- Buddy 旅行（原「猫猫旅行」改版后的状态机）----
+
+    async def buddy_travel_status(self, auth: AccountAuth) -> dict[str, Any]:
+        """Buddy 旅行当前状态（state / daily_limit_reached / reward_credit）。"""
+        from . import growth
+
+        return await growth.buddy_travel_status(self, auth)
+
+    async def buddy_travel_config(self, auth: AccountAuth) -> dict[str, Any]:
+        """Buddy 旅行可选地点列表。"""
+        from . import growth
+
+        return await growth.buddy_travel_config(self, auth)
+
+    async def buddy_travel_depart(self, auth: AccountAuth, location_id: Any) -> dict[str, Any]:
+        """派 Buddy 出发（每自然日一次）。"""
+        from . import growth
+
+        return await growth.buddy_travel_depart(self, auth, location_id)
+
+    async def buddy_travel_claim(self, auth: AccountAuth) -> dict[str, Any]:
+        """领取 Buddy 旅行奖励（仅 arrived 时有效）。"""
+        from . import growth
+
+        return await growth.buddy_travel_claim(self, auth)
+
     async def daily_chat(self, auth: AccountAuth, *, model: str = "",
                          prompt: str = "", turn_timeout: float = 120.0,
                          desktop_leg: bool = True, log: Any = None) -> dict[str, Any]:
