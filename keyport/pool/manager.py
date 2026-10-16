@@ -92,6 +92,7 @@ class AccountPool:
                     domain=row["domain"] or "",
                     file_path=row["file_path"] or "",
                     kind=row["kind"] or "oauth",
+                    base_url=row["base_url"] or "",
                     credits=int(row["credits"] or 0),
                     credits_used=int(row["credits_used"] or 0),
                     credits_expiring=int(row["credits_expiring"] or 0),
@@ -335,11 +336,25 @@ class AccountPool:
     # ---- 账号级限额护栏 ----
 
     def guard_reason(self, entry: AccountEntry, *, model: str = "") -> str:
-        """账号是否被限额护栏挡住；返回原因（空串 = 可服务）。
+        """账号是否被挡住；返回原因（空串 = 可服务）。
 
-        「免费模型」判据来自成本账本（tier 0 = 免费）；账本未观测过的模型按
-        付费处理 —— 不确定是否免费时不该当免费放行。
+        两类判定，**顺序有意**：
+
+        1. **base_url 白名单**（先判）：账号的 base_url 决定网关把它的请求连同
+           **真实 token** 发往哪里。白名单非空而该账号的 base_url 不在名单内时，
+           它既不该服务对话、也不该执行定时任务 —— 先于限额判定，因为它关乎
+           凭证外泄而非额度分配。
+        2. **限额护栏**：「免费模型」判据来自成本账本（tier 0 = 免费）；账本未观测
+           过的模型按付费处理 —— 不确定是否免费时不该当免费放行。
         """
+        allow = list(getattr(getattr(self.cfg, "security", None), "base_url_allow", None) or [])
+        if allow:
+            from ..security import base_url_violation
+
+            violation = base_url_violation(getattr(entry, "base_url", ""), allow)
+            if violation:
+                return f"base_url 不受信：{violation}"
+
         guards = getattr(self.cfg, "guards", None)
         if guards is None:
             return ""
@@ -704,6 +719,7 @@ class AccountPool:
                     uid=auth.uid, realm=auth.realm, nickname=auth.nickname,
                     enterprise_id=auth.enterprise_id, domain=auth.domain,
                     file_path=auth.file_path, kind=auth.kind,
+                    base_url=getattr(auth, "base_url", "") or "",
                     token_expires_at=auth.expires_at, refresh_token=auth.refresh_token,
                     fingerprint=fingerprint,
                     egress_proxy=getattr(auth, "egress_proxy", "") or "",
@@ -716,6 +732,7 @@ class AccountPool:
                 entry.domain = auth.domain
                 entry.file_path = auth.file_path
                 entry.kind = auth.kind
+                entry.base_url = getattr(auth, "base_url", "") or ""
                 entry.token_expires_at = auth.expires_at
                 entry.refresh_token = auth.refresh_token
                 entry.fingerprint = fingerprint

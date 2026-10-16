@@ -71,6 +71,12 @@ class AccountEntry:
     domain: str = ""
     file_path: str = ""
     kind: str = "oauth"
+    # 自带上游端点（z.ai Coding Plan / 第三方兼容端点）。空 = 走域默认端点。
+    #
+    # **安全敏感**：它决定网关把该账号的请求连同**真实 access token** 发往哪里。
+    # `security.base_url_allow` 非空时，非名单内的账号既不被选号、也不执行定时任务
+    # （2026-10-16 的入侵正是通过植入这种账号试图外带令牌）。
+    base_url: str = ""
 
     # 额度
     credits: int = 0
@@ -284,6 +290,7 @@ class AccountEntry:
             "breaker_until": self.breaker_until,
             "degraded_until": self.degraded_until,
             "model_cooldowns": dict(self.model_cooldowns),
+            "base_url": self.base_url,
             "model_reset_at": dict(self.model_reset_at),
             "consecutive_failures": self.consecutive_failures,
             "enabled": self.enabled,
@@ -334,6 +341,7 @@ class AccountEntry:
         self.failed_calls = int(state.get("failed_calls", 0) or 0)
         self.last_checkin_at = int(state.get("last_checkin_at", 0) or 0)
         self.last_daily_chat = str(state.get("last_daily_chat", "") or "")
+        self.base_url = str(state.get("base_url", "") or "")
         self.risk_strikes = int(state.get("risk_strikes", 0) or 0)
         self.last_risk_at = int(state.get("last_risk_at", 0) or 0)
         raw_fp = state.get("fingerprint")

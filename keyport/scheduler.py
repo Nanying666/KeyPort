@@ -312,6 +312,16 @@ class Scheduler:
 
     def _gate_reason(self, task: str, entry: Any) -> str:
         """该账号是否应跳过此任务；返回原因（空串 = 照常执行）。"""
+        # base_url 白名单最优先：账号的 base_url 决定网关把它的请求连同**真实
+        # token** 发往哪里。定时任务对禁用号**照常执行**（保号语义），所以
+        # 「手动摘除」挡不住外带 —— 必须在这里也判一次。
+        allow = list(getattr(self.cfg.security, "base_url_allow", None) or [])
+        if allow:
+            from .security import base_url_violation
+
+            violation = base_url_violation(getattr(entry, "base_url", ""), allow)
+            if violation:
+                return f"base_url 不受信，跳过：{violation}"
         # 活跃上报对 global 可用（实测 workbuddy.ai 的 /v2/report 返回 code=0），
         # 跳过会让国际版连登永远点不亮 —— 这里刻意不按 realm 跳过。
         if task == "activity":

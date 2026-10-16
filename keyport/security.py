@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import hashlib
 import hmac
 import ipaddress
 import os
 import secrets
+import urllib.parse
 from dataclasses import dataclass
 
 PBKDF2_ITERATIONS = 210_000
@@ -227,3 +229,65 @@ def password_strength_error(password: str, username: str = "") -> str:
     if kinds < 2:
         return "密码需包含字母、数字、符号中的至少两类"
     return ""
+
+
+# ---- 账号自带 base_url 的校验 ----
+#
+# ## 为什么需要这道闸
+#
+# 账号的 `base_url` 决定网关把该账号的请求（**连同真实 access token**）发到哪里。
+# 一个能写 base_url 的人，等于能把任意账号的令牌导向自己的服务器 —— 2026-10-16
+# 的入侵就是这样做的：通过 `/api/accounts/apikey` 植入
+# `base_url=http://<攻击者IP>:9999/adopt4` 的账号。
+#
+# 两道措施：
+#   1. **写入时校验**（本函数）：`base_url_allow` 非空时只放行白名单内的 host；
+#      为空时放行但由调用方留告警 + 审计。
+#   2. **运行时排除**：白名单非空时，带非白名单 base_url 的账号既**不参与选号**、
+#      也**不执行定时任务** —— 堵住「静默外带」（定时任务对禁用号照常执行，
+#      光靠禁用挡不住它）。
+
+#: 永远拒绝的 URL scheme（base_url 只该是 HTTP(S) 上游端点）
+_BAD_SCHEMES = ("file", "gopher", "dict", "ftp", "data", "javascript")
+
+
+def base_url_violation(url: str, allow: list[str] | None) -> str:
+    """校验账号 `base_url`；返回违规原因（空串 = 通过）。
+
+    - `url` 为空（未指定，走域默认端点）→ 通过
+    - scheme 非 http/https → 拒绝（这类 URL 不是上游 API 端点）
+    - `allow` 为空 → 通过（未声明白名单，无从判断「异常」；调用方应留告警）
+    - `allow` 非空 → host / host:port 需命中任一条（支持 `*.example.com` 通配）
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except ValueError as exc:
+        return f"base_url 无法解析：{exc}"
+    scheme = (parsed.scheme or "").lower()
+    if scheme in _BAD_SCHEMES:
+        return f"base_url 的 scheme 不被允许：{scheme}"
+    if scheme not in ("http", "https"):
+        return f"base_url 必须是 http/https，当前为 {scheme or '(空)'}"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "base_url 缺少 host"
+
+    entries = [str(e).strip().lower() for e in (allow or []) if str(e).strip()]
+    if not entries:
+        return ""  # 未声明白名单：放行，由调用方告警
+
+    candidates = {host, f"{host}:{parsed.port}" if parsed.port else host}
+    for rule in entries:
+        rule_host = rule.split("//")[-1].split("/")[0]
+        for candidate in candidates:
+            if candidate == rule_host or fnmatch.fnmatch(candidate, rule_host):
+                return ""
+    return f"base_url 的 host 不在白名单内：{host}"
+
+
+def base_url_allowed(url: str, allow: list[str] | None) -> bool:
+    """`base_url` 是否被允许（白名单为空时恒为 True）。"""
+    return base_url_violation(url, allow) == ""

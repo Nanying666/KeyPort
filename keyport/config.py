@@ -396,6 +396,16 @@ class SecurityConfig:
     # 会话 Cookie 是否加 `Secure`（HTTPS 部署应开启；纯 HTTP 部署需关闭）
     cookie_secure: bool = True
 
+    # ---- 账号自带 base_url 的白名单 ----
+    # 账号的 base_url 决定网关把该账号的请求（**连同真实 access token**）发往哪里。
+    # 2026-10-16 的入侵正是通过植入 `base_url=http://<攻击者IP>:9999/adopt4` 的账号
+    # 试图外带令牌。
+    #
+    # 非空时：写入被拒 + 运行时**既不参与选号也不执行定时任务**；
+    # 为空时：放行（未声明无从判断异常），但写入会留告警与审计。
+    # 例：["api.z.ai", "*.z.ai", "zcode.z.ai"]
+    base_url_allow: list[str] = field(default_factory=list)
+
 
 @dataclass
 class RealmConfig:

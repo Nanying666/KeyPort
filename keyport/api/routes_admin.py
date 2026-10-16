@@ -571,11 +571,23 @@ async def add_apikey_account(request: Request, _: str = Depends(require_admin)):
     base_url = str(payload.get("base_url") or "")
     if not api_key:
         raise HTTPException(status_code=400, detail="api_key 不能为空")
+    # 写入闸：base_url 决定该账号的请求（连同真实 token）发往哪里。
+    # 白名单非空时拒绝不在名单内的 host —— 这是 2026-10-16 入侵的注入点。
+    from ..security import base_url_violation
+
+    violation = base_url_violation(
+        base_url, list(ctx.cfg.security.base_url_allow or []))
+    if violation:
+        record_audit(ctx.db, client_ip(request), "account_apikey_add",
+                     base_url or "(空)", "denied", violation)
+        raise HTTPException(status_code=400, detail=violation)
     auth = api_key_account(realm, api_key, name, base_url)
     ctx.pool.upsert_account(auth)
     ctx.pool.save_state()
     post = await _post_add(ctx, auth, label="account_apikey_add")
-    record_audit(ctx.db, client_ip(request), "account_apikey_add", auth.uid, "ok")
+    # 审计里记下 base_url：白名单为空时这是唯一能事后发现异常去向的线索
+    record_audit(ctx.db, client_ip(request), "account_apikey_add", auth.uid, "ok",
+                 f"base_url={base_url or '(默认)'}")
     return {"ok": True, "uid": auth.uid, "realm": realm, **post}
 
 
