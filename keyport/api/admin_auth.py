@@ -88,10 +88,13 @@ def session_token(request: Request, x_kp_session: str = Header(default="")) -> s
 
 
 def require_admin(request: Request) -> Any:
-    """FastAPI 依赖：未登录抛 401。"""
+    """FastAPI 依赖：未登录或来源不被允许时抛 401/403。"""
     from fastapi import HTTPException
 
     ctx = request.app.state.ctx
+    ip = client_ip(request)
+    if not admin_ip_allowed(ip, ctx.cfg):
+        raise HTTPException(status_code=403, detail="管理台不允许从该来源访问")
     token = session_token(request, request.headers.get(SESSION_HEADER, ""))
     if not ctx.admin_auth.verify(token):
         raise HTTPException(status_code=401, detail="未登录或会话已过期")
@@ -103,9 +106,38 @@ def client_ip(request: Request) -> str:
     from ..security import client_ip_from_request
 
     host = request.client.host if request.client else ""
+    security = ctx.cfg.security
     return client_ip_from_request(
-        host, dict(request.headers), trust_proxy=ctx.cfg.security.trust_proxy_headers
+        host, dict(request.headers),
+        trust_proxy=security.trust_proxy_headers,
+        trusted_proxies=security.trusted_proxies,
     )
+
+
+def admin_ip_allowed(ip: str, cfg) -> bool:
+    """管理台来源是否放行（`admin_ip_allow` 为空 = 不限制）。"""
+    from ..security import ip_matches
+
+    rules = list(getattr(cfg.security, "admin_ip_allow", None) or [])
+    if not rules:
+        return True
+    return ip_matches(ip, rules)
+
+
+def request_is_https(request: Request) -> bool:
+    """请求走的是不是 HTTPS（含反向代理终结 TLS 的情形）。
+
+    `Secure` Cookie 在 HTTP 下**不会被浏览器发送** —— 所以这个判断决定了
+    「加了 Secure 之后会话还灵不灵」。纯 HTTP 部署若无条件加 Secure，会出现
+    「登录返回 200 但后续全部 401」的诡异现象。
+    """
+    if request.url.scheme == "https":
+        return True
+    ctx = request.app.state.ctx
+    if not ctx.cfg.security.trust_proxy_headers:
+        return False
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    return proto.lower() == "https"
 
 
 def bootstrap_admin_password(db: Database, cfg) -> str | None:

@@ -368,6 +368,34 @@ class SecurityConfig:
     trust_proxy_headers: bool = False
     audit_enabled: bool = True
 
+    # ---- 可信代理 ----
+    # 只有 TCP 对端落在这些 CIDR 内时，才采信 `X-Forwarded-For`；且从**右往左**
+    # 取第一个非代理地址（左侧全是请求方自己写的）。
+    #
+    # 为空 = **完全不采信 XFF**（安全默认）：宁可记录代理地址，也不记录一个
+    # 任何人都能声明的值。放在反向代理之后时填代理所在网段。
+    trusted_proxies: list[str] = field(
+        default_factory=lambda: ["127.0.0.1/32", "172.16.0.0/12"]
+    )
+
+    # ---- 管理台来源限制 ----
+    # 非空时**只有**这些 CIDR 能访问管理台端点（含登录）。为空 = 不限制。
+    #
+    # 强烈建议填上：管理台一旦公网可达，就等于把「猜密码」和「口令泄露」两条
+    # 路径同时敞开。本次入侵的管理会话正是从公网 IP 建立的。
+    admin_ip_allow: list[str] = field(default_factory=list)
+
+    # ---- 登录节流 ----
+    # 原先没有限速，可无限猜密码。两道闸：按 IP + 全局（防换 IP 绕过）。
+    login_max_failures: int = 5
+    login_window_seconds: int = 300
+    login_lockout_seconds: int = 900
+    login_lockout_max_seconds: int = 86400
+    login_global_max_failures: int = 30
+
+    # 会话 Cookie 是否加 `Secure`（HTTPS 部署应开启；纯 HTTP 部署需关闭）
+    cookie_secure: bool = True
+
 
 @dataclass
 class RealmConfig:

@@ -49,7 +49,9 @@ def _client_ip(request: Request, cfg) -> str:
 
     host = request.client.host if request.client else ""
     return client_ip_from_request(
-        host, dict(request.headers), trust_proxy=cfg.security.trust_proxy_headers
+        host, dict(request.headers),
+        trust_proxy=cfg.security.trust_proxy_headers,
+        trusted_proxies=cfg.security.trusted_proxies,
     )
 
 

@@ -34,6 +34,8 @@ class AppContext:
     limiter: Any = None
     # 后台任务作业管理器
     jobs: Any = None
+    # 面板登录节流（按 IP + 全局双维度）
+    login_guard: Any = None
     started_at: float = 0.0
     login_states: dict[str, Any] = None  # type: ignore[assignment]
 

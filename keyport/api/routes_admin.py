@@ -56,11 +56,33 @@ async def login(request: Request):
     password = str(payload.get("password", ""))
     ip = client_ip(request)
 
+    # 来源闸：`admin_ip_allow` 非空时只放行白名单内的来源
+    from .admin_auth import admin_ip_allowed
+
+    if not admin_ip_allowed(ip, ctx.cfg):
+        record_audit(ctx.db, ip, "admin_login", username, "denied", "来源不在白名单")
+        raise HTTPException(status_code=403, detail="管理台不允许从该来源访问")
+
+    # 节流闸：锁定期间**不验证密码** —— PBKDF2 21 万次迭代很贵，
+    # 无节制调用本身就是一次 CPU 打满的 DoS
+    retry_after = ctx.login_guard.retry_after(ip)
+    if retry_after > 0:
+        record_audit(ctx.db, ip, "admin_login", username, "locked",
+                     f"{int(retry_after)}s")
+        return JSONResponse(
+            status_code=429,
+            content={"detail": f"登录尝试过多，请在 {int(retry_after)} 秒后重试"},
+            headers={"Retry-After": str(max(1, int(retry_after)))},
+        )
+
     # 首启未设置密码：生成随机密码并在响应中提示一次
     generated = bootstrap_admin_password(ctx.db, ctx.cfg)
     token = ctx.admin_auth.login(username, password, ip)
-    record_audit(ctx.db, ip, "admin_login", username, "ok" if token else "fail")
     if token is None:
+        locked_for = ctx.login_guard.record_failure(ip)
+        record_audit(ctx.db, ip, "admin_login", username,
+                     "locked" if locked_for else "fail",
+                     f"锁定 {int(locked_for)}s" if locked_for else "")
         if generated:
             return JSONResponse(
                 status_code=401,
@@ -68,9 +90,17 @@ async def login(request: Request):
                          "initial_password_issued": True},
             )
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    ctx.login_guard.record_success(ip)
+    record_audit(ctx.db, ip, "admin_login", username, "ok")
+    from .admin_auth import request_is_https
+
     resp = JSONResponse(content={"ok": True, "username": username})
     resp.set_cookie(
         SESSION_COOKIE, token, httponly=True, samesite="lax",
+        # 只在 HTTPS 连接上加 Secure：HTTP 下加它会让浏览器干脆不发这个 Cookie，
+        # 表现为「登录成功但后续全是 401」
+        secure=bool(ctx.cfg.security.cookie_secure) and request_is_https(request),
         max_age=ctx.cfg.security.session_ttl_seconds,
     )
     return resp
@@ -104,14 +134,23 @@ async def change_password(request: Request, _: str = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
     old = str(payload.get("old_password", ""))
     new = str(payload.get("new_password", ""))
-    if len(new) < 8:
-        raise HTTPException(status_code=400, detail="新密码至少 8 位")
+    # 强度闸：原先只要求 8 位。面板一旦公网可达，「够长」就是主要防线 ——
+    # 本次入侵的管理会话正是靠一个可猜/可得的短口令建立的。
+    from ..security import password_strength_error
+
+    weak = password_strength_error(new, ctx.cfg.security.admin_username)
+    if weak:
+        raise HTTPException(status_code=400, detail=weak)
     if not verify_password(old, ctx.cfg.security.admin_password_hash):
         raise HTTPException(status_code=400, detail="原密码错误")
     ctx.cfg.security.admin_password_hash = hash_password(new)
     save_config(ctx.cfg)
-    record_audit(ctx.db, client_ip(request), "change_password", "", "ok")
-    return {"ok": True}
+    # 改密即吊销全部既有会话：口令泄露后改密是标准处置，
+    # 留着旧会话等于没改（攻击者仍持有有效令牌）
+    revoked = ctx.db.execute("DELETE FROM admin_sessions").rowcount
+    record_audit(ctx.db, client_ip(request), "change_password", "", "ok",
+                 f"revoked_sessions={revoked}")
+    return {"ok": True, "revoked_sessions": int(revoked or 0)}
 
 
 # ---- 账号：列表 / 概览 ----

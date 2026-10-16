@@ -33,6 +33,7 @@ from .auth.store import load_auth_dir
 from .budget import DailyBudget
 from .config import Config, get_config
 from .db import init_db
+from .login_guard import LoginGuard
 from .pool.manager import AccountPool
 from .ratelimit import ClientLimiter
 from .scheduler import TASKS, Scheduler
@@ -143,6 +144,13 @@ def build_context(cfg: Config | None = None) -> AppContext:
         budget=budget,
         limiter=ClientLimiter(),
         jobs=jobs,
+        login_guard=LoginGuard(
+            max_failures=cfg.security.login_max_failures,
+            window_seconds=cfg.security.login_window_seconds,
+            lockout_seconds=cfg.security.login_lockout_seconds,
+            max_lockout_seconds=cfg.security.login_lockout_max_seconds,
+            global_max_failures=cfg.security.login_global_max_failures,
+        ),
         started_at=time.time(),
     )
     ctx.admin_auth = AdminAuth(db, cfg)  # type: ignore[attr-defined]
@@ -168,6 +176,15 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if generated:
             log.warning("=" * 64)
             log.warning("面板初始密码（仅本次显示，请立即登录后修改）：%s", generated)
+            log.warning("=" * 64)
+        # 管理台来源未限制时给出明确告警：面板一旦公网可达，就等于把「猜密码」
+        # 和「口令泄露」两条路径同时敞开 —— 运维需要在部署层做决定，代码只能提示。
+        if not (cfg.security.admin_ip_allow or []):
+            log.warning("=" * 64)
+            log.warning("管理台未限制来源（security.admin_ip_allow 为空）——"
+                        "任何能访问该端口的来源都可以尝试登录。")
+            log.warning("建议填入你的固定出口 IP/CIDR，例如："
+                        "\"admin_ip_allow\": [\"203.0.113.7/32\"]")
             log.warning("=" * 64)
         ctx.scheduler.start()
         # 后台任务作业：先加载磁盘状态（陈旧的 pending/running 会被判为 interrupted），

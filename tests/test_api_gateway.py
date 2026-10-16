@@ -73,7 +73,9 @@ def client(tmp_path: Path) -> TestClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
 
     ctx.client.client = _mock_client  # type: ignore[method-assign]
-    with TestClient(app) as tc:
+    # 对端用真实 IP（默认是 "testclient"）。IP 判定现在只在「对端是可信代理」时
+    # 才采信 X-Forwarded-For —— 用一个不可解析的对端名会让测试走不到那条分支。
+    with TestClient(app, client=("127.0.0.1", 50000)) as tc:
         yield tc
 
 
@@ -282,8 +284,8 @@ def test_disabled_key_rejected(client: TestClient):
 
 
 # ---- 全局 IP 管控 ----
-# TestClient 的对端 host 是 "testclient"（非合法 IP），因此必须开启代理头信任
-# 并显式提供 X-Forwarded-For，才能走到真实的 IP 判定分支。
+# 对端是 127.0.0.1（可信代理），因此可以显式提供 X-Forwarded-For 走到真实的
+# IP 判定分支。这正是生产形态：反向代理在回环/内网，XFF 由它追加。
 
 
 def test_global_blocklist_rejects(client: TestClient):
