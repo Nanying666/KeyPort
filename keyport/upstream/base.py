@@ -17,6 +17,7 @@ class ErrorKind(str, Enum):
     PAYMENT = "payment"        # 402 / 余额耗尽 → 硬冷却至次日
     MODEL_LIMIT = "model_limit"  # 该模型用量超限 → 仅冷却该模型
     BAD_REQUEST = "bad_request"  # 400 请求本身不合法 → 不冷却，直接回客户端
+    CONTENT_BLOCKED = "content_blocked"  # 内容策略拦截（system 指纹误报）→ 不罚账号，换中性提示词重试
     CAPTCHA = "captcha"        # 上游端点要求人机验证（3007）→ 非账号过错，不冷却不换号
     RISK = "risk"              # 风控 3012 / unusual activity → 指数退避，累计升级禁用
     WAF = "waf"                # 403 且无业务信封（WAF 拦截页）→ 指向出口 IP 而非账号
@@ -60,10 +61,14 @@ class UpstreamError(Exception):
     def should_failover(self) -> bool:
         """是否应换号重试。
 
-        请求本身非法（BAD_REQUEST）或上游要求人机验证（CAPTCHA）时都不换号：
-        前者换号也没用，后者同域账号共用同一端点、换号同样被拦。
+        请求本身非法（BAD_REQUEST）、上游要求人机验证（CAPTCHA）或内容策略
+        拦截（CONTENT_BLOCKED）时都不换号：前两者换号也没用，后者是**同一份
+        body** 被判内容审核误杀，换任何账号都会被同样拦下 —— 正确处置是换
+        中性提示词重试（见 `api.gateway`），而不是消耗池里其他健康账号。
         """
-        return self.kind not in (ErrorKind.BAD_REQUEST, ErrorKind.CAPTCHA)
+        return self.kind not in (
+            ErrorKind.BAD_REQUEST, ErrorKind.CAPTCHA, ErrorKind.CONTENT_BLOCKED,
+        )
 
 
 def _is_captcha_challenge(text: str) -> bool:
@@ -126,6 +131,14 @@ def classify_status(status: int, body: str = "") -> ErrorKind:
     # 风控先于 405 的通用 4xx 判定：405 在本生态里承载 3012
     if is_risk_control(status, text):
         return ErrorKind.RISK
+    # 内容策略拦截（400/403 + 审核文案）：必须在下面 401/403 → AUTH 之前判定 ——
+    # 「unapproved channel / illegal api invocation」是**内容审核**文案，账号余额、
+    # 权限、限流全都健康，判成 AUTH 会把健康号直接禁用（`apply_error` 里
+    # AUTH 分支就是 `enabled=False`）。
+    from .prompt import looks_blocked
+
+    if looks_blocked(status, text):
+        return ErrorKind.CONTENT_BLOCKED
     if status == 429:
         return ErrorKind.RATE_LIMIT
     if status == 404:

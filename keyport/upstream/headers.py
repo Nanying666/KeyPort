@@ -29,6 +29,8 @@ DEFAULT_CLI_VERSION = "2.137.1"
 
 ORIGIN_CN = "https://www.codebuddy.cn"
 ORIGIN_GLOBAL = "https://www.workbuddy.ai"
+# global chat 的 X-Domain 声明值（与 Origin 同域，不带协议）
+GLOBAL_CHAT_DOMAIN = "www.workbuddy.ai"
 ORIGIN_ZAI = C.ZAI_API_ORIGIN
 
 
@@ -144,12 +146,20 @@ def _inject_conversation(headers: dict[str, str], meta: ChatMeta) -> str:
 
 
 def _inject_global_chat_headers(headers: dict[str, str], auth: AccountAuth) -> None:
+    """global 域 chat 专属声明头（对齐官方国际版客户端）。
+
+    与 workbuddy2api-panel `injectGlobalChatHeaders` 同一口径：
+      - `X-No-Enterprise-Id: 1`：个人账号无企业 ID 时**显式声明**。缺省不发会让
+        上游按「缺省/可疑」判定，可能直接回 `unapproved channel` 类拒绝。
+      - `X-Domain`：显式声明国际版域，与 Origin/Referer 同域。
+    """
     headers["X-User-Id"] = auth.uid
     if auth.enterprise_id:
         headers["X-Enterprise-Id"] = auth.enterprise_id
         headers["X-Tenant-Id"] = auth.enterprise_id
-    if auth.domain:
-        headers["X-Domain"] = auth.domain
+    else:
+        headers["X-No-Enterprise-Id"] = "1"
+    headers["X-Domain"] = auth.domain or GLOBAL_CHAT_DOMAIN
 
 
 def chat_headers(

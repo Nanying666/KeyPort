@@ -20,7 +20,13 @@ from ..upstream import constants as C
 from ..upstream.base import AccountAuth, ChatMeta, ErrorKind, UpstreamError
 from ..upstream.client import UpstreamClient, is_zcode_plan
 from ..upstream.payload import prepare_body
-from ..upstream.prompt import load_prompt_text
+from ..upstream.prompt import (
+    DEGRADABLE_MODES,
+    DEGRADED_PROMPT,
+    MODE_APPEND,
+    MODE_CUSTOM,
+    load_prompt_text,
+)
 from ..upstream.thinking import supported_efforts
 
 if TYPE_CHECKING:
@@ -117,6 +123,8 @@ class ChatSession:
         self._origin_body: dict[str, Any] = dict(params.body)
         # Anthropic 原生上游：下游协议不是 anthropic 时需要把上游事件转回 OpenAI chunk
         self.anthropic_upstream = False
+        # 本次请求是否已切到 Degraded 中性提示词（内容策略误报的自愈动作）
+        self.degraded_prompt = False
         # 模型原生工具调用标记（DSML）修复器：三条流式协议共用同一个实例
         # （同一条响应流），非流式路径另走 repair_aggregated_response。
         self.markup_repair = self._build_markup_repair()
@@ -137,7 +145,7 @@ class ChatSession:
 
     # ---- 建立 ----
 
-    def _build_anthropic_body(self, prompt_text: str) -> bytes:
+    def _build_anthropic_body(self, prompt_text: str, *, degraded: bool = False) -> bytes:
         """构造 Anthropic Messages 请求体（上游为 Anthropic 原生时使用）。
 
         入站已统一为 OpenAI chat 形态，这里转成 Anthropic 形态；system 提示词
@@ -157,12 +165,13 @@ class ChatSession:
         messages = payload.get("messages") or []
 
         # Anthropic 的 system 是顶层字段：替换模式下用配置文本，否则保留原 system
-        from ..upstream.prompt import MODE_CUSTOM
-
         mode = self.gateway.cfg.prompt.mode
-        if mode == MODE_CUSTOM and prompt_text:
+        if degraded:
+            # 内容策略误报：换中性提示词，丢掉客户端原始 system
+            payload["system"] = DEGRADED_PROMPT
+        elif mode == MODE_CUSTOM and prompt_text:
             payload["system"] = prompt_text
-        elif mode == "append" and prompt_text:
+        elif mode == MODE_APPEND and prompt_text:
             existing = payload.get("system") or ""
             payload["system"] = f"{existing}\n\n{prompt_text}" if existing else prompt_text
 
@@ -207,6 +216,9 @@ class ChatSession:
         prompt_text = load_prompt_text(
             cfg.prompt.mode, cfg.prompt.file, cfg.prompt.default_text
         )
+        # 内容策略误报是否可自愈：只有 passthrough / append 才有「客户端 system
+        # 被上游指纹审核误杀」这回事（custom 已是网关自有提示词）。
+        degradable = cfg.prompt.mode in DEGRADABLE_MODES
         compress_max = COMPRESS_TOKENS if (
             cfg.features.compress_long_context and self.params.protocol == "responses"
         ) else 0
@@ -263,7 +275,8 @@ class ChatSession:
                 continue
 
             try:
-                await self._attempt(entry, auth, prompt_text, compress_max, pool_cfg)
+                await self._attempt(entry, auth, prompt_text, compress_max, pool_cfg,
+                                    degradable=degradable)
                 return self
             except UpstreamError as exc:
                 last_err = exc
@@ -300,13 +313,17 @@ class ChatSession:
 
     async def _attempt(
         self, entry: Any, auth: AccountAuth, prompt_text: str, compress_max: int,
-        pool_cfg: Any,
+        pool_cfg: Any, *, degradable: bool = False,
     ) -> None:
         """用单个账号尝试建立上游流（含通道级重试与回退切换）。
 
         **并发槽生命周期由本方法独占**：进入时已持有 1 个槽；等待类重试会先让出
         再取回；无论成功、失败还是异常，退出时槽位恰好归零或转交本会话
         （成功时 `_holding=True`，由 `close()` 释放）。
+
+        **内容策略误报**（`CONTENT_BLOCKED`）：同账号换 Degraded 中性提示词重试
+        一次（不换号、不罚账号）。降级态由网关的 `content_gate` 跨请求保持到
+        次日 00:00 CST —— 命中过一次后同一进程内不再先撞一次 400。
         """
         gw = self.gateway
         captcha_retries = 0
@@ -315,13 +332,17 @@ class ChatSession:
         use_fallback = False          # 请求级通道决策（不改账号状态）
         needs_captcha = is_zcode_plan(auth)
         holding = True
+        # 进入降级期（本进程早前已命中过误报）→ 首次请求就直达中性提示词
+        degraded = degradable and gw.content_gate.active()
+        self.degraded_prompt = degraded
 
         try:
             while True:
                 current = auth.as_fallback() if (use_fallback and auth.has_fallback()) else auth
                 self.anthropic_upstream = current.is_anthropic()
                 body_bytes = self._rewrite_body(
-                    prompt_text, entry.realm, compress_max, entry.uid
+                    prompt_text, entry.realm, compress_max, entry.uid,
+                    degraded=degraded,
                 )
                 meta = ChatMeta(
                     conversation_id=self.params.conversation_id,
@@ -332,6 +353,17 @@ class ChatSession:
                         auth, body_bytes, meta, force_fallback=use_fallback
                     )
                 except UpstreamError as exc:
+                    if (
+                        exc.kind == ErrorKind.CONTENT_BLOCKED
+                        and degradable and not degraded
+                    ):
+                        # system 指纹误报：同请求内换中性提示词重试（账号不罚、
+                        # 不换号 —— 换号会被同样拦下，纯属消耗健康账号）。
+                        gw.content_gate.trigger()
+                        degraded = True
+                        self.degraded_prompt = True
+                        self._note_error(exc)
+                        continue
                     (
                         captcha_retries, retries_429, retries_5xx, use_fallback,
                         action, holding,
@@ -495,13 +527,17 @@ class ChatSession:
             pass
 
     def _rewrite_body(self, prompt_text: str, account_realm: str,
-                      compress_max: int, account_uid: str = "") -> bytes:
+                      compress_max: int, account_uid: str = "",
+                      *, degraded: bool = False) -> bytes:
         """按实际账号域改写请求体（每次换号都重新改写，域随账号变化）。
 
         从原始入站快照出发，避免在已改写结果上二次改写（换号重试时）。
 
         `account_uid` 参与上游前缀缓存键的构造：**按账号隔离是硬要求** ——
         跨账号复用同一 cache key 会让上游命中错账号的前缀缓存、泄露对方对话。
+
+        `degraded`：内容策略误报自愈 —— 整体替换 system 为中性提示词
+        （`DEGRADED_PROMPT`），其余字段与消息逐字不动。
         """
         cfg = self.gateway.cfg
         self.params.body = dict(self._origin_body)
@@ -514,15 +550,16 @@ class ChatSession:
                 self.params.body, account_uid, self.params.conversation_id
             )
         if self.anthropic_upstream:
-            return self._build_anthropic_body(prompt_text)
+            return self._build_anthropic_body(prompt_text, degraded=degraded)
         return prepare_body(
             json.dumps(self.params.body, ensure_ascii=False).encode("utf-8"),
             sanitize=cfg.features.sanitize_blacklist_fingerprints,
-            prompt_mode=cfg.prompt.mode,
-            prompt_text=prompt_text,
+            prompt_mode=MODE_CUSTOM if degraded else cfg.prompt.mode,
+            prompt_text=DEGRADED_PROMPT if degraded else prompt_text,
             efforts=supported_efforts(self.params.model),
             is_global=(account_realm == "global"),
             compress_max_tokens=compress_max,
+            force_custom_system=degraded,
         )
 
     # ---- 读取 ----
@@ -665,6 +702,11 @@ class Gateway:
         from ..upstream.rotateguard import WafIpGate
 
         self.waf_gate = WafIpGate()
+        # 内容策略误报闸门：passthrough/append 命中「unapproved channel」类审核后，
+        # 本进程内保持 Degraded 中性提示词到次日 00:00 CST（进程内存态，重启清零）。
+        from ..upstream.content_gate import ContentBlockGate
+
+        self.content_gate = ContentBlockGate()
         # 进程停机信号：换号退避等待可被取消（优雅停机不必等退避睡醒）
         self.stop_event: asyncio.Event | None = None
         # 当日积分预算闸（由 app 装配注入；None = 未接线，闸不生效）

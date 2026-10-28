@@ -16,6 +16,21 @@ MODE_APPEND = "append"
 
 DEFAULT_PROMPT = "You are a helpful assistant."
 
+# 降级中性提示词：内容策略**误报**时用，刻意极简、无任何客户端指纹模板句。
+#
+# 触发场景（对齐 workbuddy2api-panel 的 prompt.Degraded）：passthrough / append
+# 模式下客户端（Claude Code / Codex 等 CLI）在 system 里注入固定模板句，上游按
+# **逐字精确匹配**审核，合法流量被误杀成「非授权渠道」：
+#   HTTP 400 + `Illegal API invocation from an unapproved channel`
+# 换这段最小中性提示词重试即可绕开 system 来源的误报；不改变用户指令语义。
+DEGRADED_PROMPT = (
+    "You are a helpful assistant. Respond in the user's language, "
+    "follow the user's instructions, and be direct and concise."
+)
+
+# 可降级的提示词模式：custom 已用自有提示词替换 system，不存在 system 指纹误报
+DEGRADABLE_MODES = (MODE_PASSTHROUGH, MODE_APPEND)
+
 
 def load_prompt_text(mode: str, file_path: str, default_text: str) -> str:
     """读取自定义提示词文件；缺失/为空回落内置默认。"""
@@ -68,6 +83,11 @@ def has_custom_system(obj: dict[str, Any]) -> bool:
 
 
 # 上游内容拦截的识别指纹（用于 passthrough → custom 降级重试判定）
+#
+# 后三条来自上游对「渠道指纹」的审核文案（实测 400）：
+#   Illegal API invocation from an unapproved channel / blocked by security policy
+# 语义是**内容审核**而非账号鉴权 —— 账号余额/权限/限流状态都健康，判成 AUTH
+# 会把健康号直接禁用（见 `base.classify_status` 的判定顺序）。
 BLOCK_MARKERS = (
     "内容安全",
     "content_filter",
@@ -76,6 +96,9 @@ BLOCK_MARKERS = (
     "sensitive",
     "11-128",
     "11-130",
+    "blocked by security policy",
+    "unapproved channel",
+    "illegal api invocation",
 )
 
 

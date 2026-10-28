@@ -159,6 +159,14 @@ def apply_error(
         entry.failed_calls = max(0, entry.failed_calls - 1)
         return "captcha_required"
 
+    if kind == ErrorKind.CONTENT_BLOCKED:
+        # 内容策略拦截（system 指纹误报）：账号余额 / 权限 / 限流全都健康，
+        # 拦的是**请求内容**不是账号。不冷却、不熔断、不计错、不换号 ——
+        # 处置在网关侧（换 Degraded 中性提示词重试），这里只抵消开头的自增。
+        entry.consecutive_failures = max(0, entry.consecutive_failures - 1)
+        entry.failed_calls = max(0, entry.failed_calls - 1)
+        return "content_blocked"
+
     # BAD_REQUEST：请求本身问题，不该换号，也不该惩罚账号。
     # 但它属于"不知道原因的失败"（上游没给权威分类），喂连败降权计数器 ——
     # 达阈值只降权（可逆），不熔断（熔断会把整池批量摘除）。

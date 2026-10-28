@@ -294,6 +294,7 @@ zai:glm-5.3-flash             → 强制 z.ai（GLM Coding Plan）
 | **429 频控** | **不冷却**，按 `Retry-After`（封顶 120s）原地等待重试；耗尽后换号 | 保持可用，不计连败 |
 | **429 + 1113**（Key 无资源包） | 永久态，**不等待**，直接切回退通道 / 换号 | 保持可用 |
 | **验证码 3007** | 同账号换码重试（≤3 次），被拒的码立即出池 | 不冷却不熔断不计连败 |
+| **内容策略拦截**（`unapproved channel` / `illegal api invocation` / `blocked by security policy`） | 判为 system 指纹误报：同请求换中性提示词重试一次，不换号 | 不冷却不熔断不计连败 |
 | **5xx / 连接失败** | 原地重试（≤3 次），耗尽后冷却 300s 换号 | `cooling` |
 | **风控 3012 / 405** | 指数退避 900s 起封顶 24h，**不原地重试** | `cooling`，累计 4 次升级禁用 |
 | **401 / 403 鉴权** | 立即换号；有回退 Key 时先切回退 | 禁用（需重新授权） |
@@ -377,6 +378,26 @@ curl http://localhost:8790/v1/usage -H "Authorization: Bearer sk-kp-xxxx"
 `tool_choice` 归一化（上游只认 string）→ `developer` 角色归一为 `system` →
 tool 配对重排 + 孤儿清理 → DeepSeek 思维链注入 + effort 档位降级 + `reasoning_content` 回填 →
 指纹脱敏（可关闭）→ 系统提示词替换（`custom` / `passthrough` / `append`）。
+
+#### 内容策略误报的自愈（`unapproved channel`）
+
+上游对 system 提示词做**逐字精确匹配**审核：客户端（Claude Code / Codex 等 CLI）注入的
+固定模板句会被误杀成「非授权渠道」，表现为
+
+```json
+{"message":"Illegal API invocation from an unapproved channel","type":"upstream_bad_request"}
+```
+
+这是**误报**——账号余额、权限、限流状态都健康，换号同样被拦。处置与
+`workbuddy2api-panel` 一致：
+
+1. 该文案（`blocked by security policy` / `unapproved channel` / `illegal api invocation`）
+   归类为 `CONTENT_BLOCKED`，**不冷却 / 不熔断 / 不计连败 / 不换号**；
+2. `passthrough` / `append` 模式首遇拦截 → 同请求内把 system 整体替换为中性提示词
+   （`upstream/prompt.py:DEGRADED_PROMPT`）重试一次，用户消息逐字不动；
+3. 第二次仍被拦（用户内容本身触发审核）→ 如实返回 `upstream_content_blocked` 给调用方；
+4. 触发后本进程内直达中性提示词，直到**次日 00:00 CST** 重新探测（进程内存态，重启清零）；
+5. `custom` 模式已用网关自有提示词替换 system，不进这条路径。
 
 ### 自动化任务(CodeBuddy/WorkBuddy)
 
@@ -653,7 +674,7 @@ KP_CONFIG_FILE=/app/data/config.json     # 配置文件位置（容器里推荐�
 | `models` | `aliases` | 模型别名映射（见「模型别名映射」） |
 | `session_sticky` | `enabled` / `ttl_seconds` / `redis_url` | 会话粘性；填 `redis_url` 可跨重启保留绑定 |
 | `schedule` | `*_hours` / `*_enabled` | 五类定时任务的时间与开关（见「自动化任务」） |
-| `prompt` | `mode` / `file` / `default_text` | 提示词策略：`custom`（替换）/ `append`（追加）/ `passthrough`（透传） |
+| `prompt` | `mode` / `file` / `default_text` | 提示词策略：`custom`（替换）/ `append`（追加）/ `passthrough`（透传）。后两者命中上游内容策略误报时自动换中性提示词重试，见[内容策略误报的自愈](#内容策略误报的自愈unapproved-channel) |
 | `features` | `sanitize_blacklist_fingerprints` | 指纹脱敏（关闭可能触发上游风控） |
 | | `compress_long_context` / `reasoning_injection` | 长上下文压缩、思维链注入 |
 | `security` | `admin_password_hash` | 面板密码摘要，留空则首次启动生成随机密码 |
